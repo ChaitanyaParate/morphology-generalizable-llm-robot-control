@@ -158,7 +158,13 @@ class GNNActorCritic(nn.Module):
         B        = batch.max().item() + 1
         mean     = mean.view(B, self.num_joints)       # [B, J]
 
-        std  = self.log_std.exp().clamp(1e-4, 0.15)    # [J]
+        # log_std starts at -1.0 → exp(-1.0) = 0.368 std.
+        # Clamp min=0.01 prevents std collapsing to zero.
+        # No max clamp -- let the policy learn its own exploration scale.
+        # Previously clamp(1e-4, 0.15) was wrong: exp(-1.0)=0.368 > 0.15,
+        # so std was immediately clamped to 0.15 on step 1, log_std gradients
+        # were blocked, and entropy was constant throughout training.
+        std  = self.log_std.exp().clamp(min=0.01)          # [J]
         std  = std.unsqueeze(0).expand_as(mean)        # [B, J]
         dist = Normal(mean, std)
 

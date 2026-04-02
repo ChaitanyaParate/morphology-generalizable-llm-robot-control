@@ -268,22 +268,14 @@ def generate_launch_description():
     vision_node = TimerAction(
         period=5.0,
         actions=[
-            Node(
-                package=PKG,
-                executable="vision_node",
-                name="vision_node",
-                output="screen",
-                parameters=[
-                    {
-                        "use_sim_time": True,
-                        "yolo_model":   "yolov8n.pt",
-                        "conf_threshold": 0.4,
-                        "image_topic":  "/camera/image_raw",
-                        "output_topic": "/scene_graph",
-                        "publish_rate":  2.0,   # Hz -- LLM does not need 30 fps
-                    }
+            ExecuteProcess(
+                cmd=[
+                    '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/.venv/bin/python',
+                    '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/morpho_robot/vision_node.py',
+                    '--yolo_model', 'yolov8s.pt',
+                    '--conf', '0.4'
                 ],
-                arguments=["--ros-args", "--log-level", LaunchConfiguration("log_level")],
+                output='screen',
             )
         ],
     )
@@ -377,7 +369,7 @@ def generate_launch_description():
                 'Relational_Bias_for_Morphological_Generalization/'
                 'morpho_gnn_robot/gnn_policy_node.py',
                 '--checkpoint',
-                '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/gnn_ppo_401408.pt',
+                '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/gnn_ppo_301056.pt',
                 '--urdf',
                 '/mnt/newvolume/Programming/Python/Deep_Learning/'
                 'Relational_Bias_for_Morphological_Generalization/'
