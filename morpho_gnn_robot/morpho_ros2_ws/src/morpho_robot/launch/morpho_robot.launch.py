@@ -197,6 +197,7 @@ def generate_launch_description():
                 arguments=[
                     "-topic", "/robot_description",
                     "-name",  "robot",
+                    "-world", "robot_world",
                     "-x",     "0.0",
                     "-y",     "0.0",
                     "-z",     "1.0",   # spawn slightly above ground
@@ -416,7 +417,7 @@ def generate_launch_description():
             spawn_robot,            # +2 s
             gz_bridge,              # +4 s
             vision_node,            # +5 s
-            llm_planner_node,       # +5 s
+            #llm_planner_node,       # +5 s
             skill_translator_node,  # +5 s
             gnn_policy_node,        # +2.5 s
             rviz,                   # conditional

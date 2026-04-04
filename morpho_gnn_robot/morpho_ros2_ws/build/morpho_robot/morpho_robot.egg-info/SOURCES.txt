@@ -20,14 +20,16 @@ meshes/anymal_thigh_r.dae
 meshes/base_uv_texture.jpg
 meshes/carbon_uv_texture.jpg
 morpho_robot/__init__.py
+morpho_robot/gnn_actor_critic.py
 morpho_robot/gnn_policy_node.py
 morpho_robot/llm_planner_node.py
 morpho_robot/read_joints.py
 morpho_robot/skill_translator_node.py
+morpho_robot/urdf_to_graph.py
 morpho_robot/vision_node.py
 resource/morpho_robot
 test/test_copyright.py
 test/test_flake8.py
 test/test_pep257.py
 urdf/anymal.urdf
-worlds/robot_world.sdf
+worlds/warehouse_world.sdf
