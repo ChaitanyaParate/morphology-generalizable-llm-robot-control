@@ -5,7 +5,7 @@ gnn_policy_node.py  (corrected)
 Deploys a trained GNN PPO checkpoint into ROS2 Jazzy.
 
 Subscribes  : /joint_states          (sensor_msgs/JointState)
-Publishes   : /effort_commands       (std_msgs/Float64MultiArray)
+Publishes   : /model/robot/joint/*/cmd_pos (std_msgs/Float64)
 Control Hz  : 20 Hz (timer-driven, non-blocking)
 
 Bugs fixed vs first version
@@ -49,7 +49,7 @@ import torch
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64
 
 try:
     from gnn_actor_critic import GNNActorCritic
@@ -58,14 +58,15 @@ except ImportError as e:
     print(f"[FATAL] Cannot import project modules: {e}")
     print("        cd into the directory containing gnn_actor_critic.py and urdf_to_graph.py first.")
     sys.exit(1)
+    
 
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION  -- only change these
 # ---------------------------------------------------------------------------
 CONTROL_HZ          = 20      # Hz, must not block
-TORQUE_SCALE        = 40.0    # action in [-1,1] * TORQUE_SCALE = Nm (ANYmal B ~40 Nm)
-JOINT_COMMAND_TOPIC = "/effort_commands"   # check: ros2 topic list | grep -i effort
+POSITION_SCALE      = 0.5     # action in [-1,1] -> target position command scale (rad)
+JOINT_COMMAND_FMT   = "/model/robot/joint/{}/cmd_pos"
 HIDDEN_DIM          = 64      # must match what you trained with (Config.hidden_dim default)
 
 
@@ -102,14 +103,15 @@ class GNNPolicyNode(Node):
         self.create_subscription(
             JointState, "/joint_states", self._cb_joint_states, 10
         )
-        self._pub = self.create_publisher(
-            Float64MultiArray, JOINT_COMMAND_TOPIC, 10
-        )
+        self._joint_pubs = {
+            jname: self.create_publisher(Float64, JOINT_COMMAND_FMT.format(jname), 10)
+            for jname in self.builder.joint_names
+        }
         self.create_timer(1.0 / CONTROL_HZ, self._control_cb)
 
         self.get_logger().info(
             f"Ready. Publishing {self.builder.num_joints} joint commands "
-            f"to '{JOINT_COMMAND_TOPIC}' at {CONTROL_HZ} Hz."
+            f"to '{JOINT_COMMAND_FMT}' at {CONTROL_HZ} Hz."
         )
 
     # -----------------------------------------------------------------------
@@ -242,12 +244,14 @@ class GNNPolicyNode(Node):
         # This node publishes raw [-1,1] offsets for now so you can verify
         # signal flow first. Switch to A or B after confirming connectivity.
         # ----------------------------------------------------------------
-        msg = Float64MultiArray()
-        msg.data = action_np.tolist()
-        self._pub.publish(msg)
+        cmd_pos = action_np * POSITION_SCALE
+        for i, jname in enumerate(self.builder.joint_names):
+            msg = Float64()
+            msg.data = float(cmd_pos[i])
+            self._joint_pubs[jname].publish(msg)
 
         self.get_logger().debug(
-            f"Actions: {np.round(action_np, 3).tolist()}",
+            f"Cmd pos (rad): {np.round(cmd_pos, 3).tolist()}",
             throttle_duration_sec=1.0,
         )
 

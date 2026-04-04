@@ -337,9 +337,7 @@ if __name__ == "__main__":
 
     path = (
         sys.argv[1] if len(sys.argv) > 1 else
-        "/mnt/newvolume/Programming/Python/Deep_Learning/"
-        "Relational_Bias_for_Morphological_Generalization/"
-        "morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/urdf/anymal.urdf"
+        "/kaggle/working/anymal_stripped.urdf"
     )
 
     rng = np.random.default_rng(42)

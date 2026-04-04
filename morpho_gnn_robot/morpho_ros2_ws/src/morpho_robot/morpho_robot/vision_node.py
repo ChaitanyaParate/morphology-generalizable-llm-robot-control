@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # vision_node.py
 
+import os
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
@@ -10,6 +12,8 @@ from ultralytics import YOLO
 import json
 import numpy as np
 import argparse
+#export QT_QPA_FONTDIR=/usr/share/fonts
+os.environ['QT_QPA_FONTDIR'] = '/usr/share/fonts'
 import cv2
 class VisionNode(Node):
     def __init__(self, args):

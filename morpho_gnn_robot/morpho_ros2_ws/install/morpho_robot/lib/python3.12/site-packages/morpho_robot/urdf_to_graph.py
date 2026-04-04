@@ -12,20 +12,32 @@ Edges  : joint A -> joint B  iff  A.child_link == B.parent_link
 Node features
   Static  (URDF, computed once) : [type_onehot(4), axis(3), lower, upper, effort, velocity]  ->  11
   Runtime (injected each step)  : [joint_pos, joint_vel]                                      ->   2
-  Total                         :                                                                  13
+  Total                         :                                                                  20
+
+  NOTE: NODE_DIM is now 20 (was 13 before body orientation was added).
+  gnn_actor_critic.py must be constructed with node_dim=20.
 
 Edge features : [origin(3), direction(1)]  ->  4
   direction = +1.0 for parent->child, -1.0 for child->parent
-  Direction is NOT normalized -- it is categorical.
+
+Node roles (used by HeteroGNNActorCritic for type-specific projections)
+  0 : body (virtual root node)
+  1 : HAA  (hip abduction/adduction) -- rolls leg sideways
+  2 : HFE  (hip flexion/extension)   -- swings leg fwd/back
+  3 : KFE  (knee flexion/extension)  -- knee joint
+  4 : generic joint (unknown suffix)
+
+  Role is inferred from joint name suffix (last '_'-delimited token).
+  For ANYmal: LF_HAA -> role 1, LH_HFE -> role 2, RF_KFE -> role 3.
+  For a hexapod with different naming, unknown suffixes fall back to role 4.
+  Add entries to JOINT_ROLE_MAP to cover your morphology.
 
 Usage in RL training loop
 -------------------------
     builder = URDFGraphBuilder("anymal.urdf")
-
-    obs = env.reset()
-    pos, vel = obs[:12], obs[12:24]          # your env's joint state slice
-    graph = builder.get_graph(pos, vel)      # call every step
-    actions, value = policy(graph)           # GNN forward
+    graph = builder.get_graph(pos, vel, body_quat, body_grav)
+    # graph.node_types : LongTensor [num_nodes]  -- NEW field
+    actions, value = policy(graph)
 """
 
 import xml.etree.ElementTree as ET
@@ -45,10 +57,41 @@ CONTROLLABLE   = {"revolute", "continuous", "prismatic"}
 STATIC_DIM      = 11   # type_onehot(4) + axis(3) + limits(4)
 JOINT_RUNTIME   = 2    # joint_pos, joint_vel
 BODY_EXTRA      = 7    # quat(4) + projected_gravity(3)
-RUNTIME_DIM     = JOINT_RUNTIME + BODY_EXTRA   # 9 -- body node gets all; joints get zeros for extra
+RUNTIME_DIM     = JOINT_RUNTIME + BODY_EXTRA   # 9
 NODE_DIM        = STATIC_DIM + RUNTIME_DIM     # 20
 
 EDGE_DIM        = 4
+
+# -----------------------------------------------------------------------
+# Node role mapping -- extend this for non-ANYmal morphologies
+# -----------------------------------------------------------------------
+NODE_ROLE_BODY    = 0
+NODE_ROLE_HAA     = 1
+NODE_ROLE_HFE     = 2
+NODE_ROLE_KFE     = 3
+NODE_ROLE_GENERIC = 4   # fallback for unknown suffix
+NUM_NODE_ROLES    = 5
+
+JOINT_ROLE_MAP: Dict[str, int] = {
+    "HAA":    NODE_ROLE_HAA,
+    "HFE":    NODE_ROLE_HFE,
+    "KFE":    NODE_ROLE_KFE,
+    # Add hexapod or other morphology joints here, e.g.:
+    # "COXA":  NODE_ROLE_HAA,   # same role semantics for hip joint
+    # "FEMUR": NODE_ROLE_HFE,
+    # "TIBIA": NODE_ROLE_KFE,
+}
+
+
+def _joint_role(joint_name: str) -> int:
+    """
+    Infer node role from the joint name suffix.
+    LF_HAA -> last token 'HAA' -> NODE_ROLE_HAA (1)
+    Unknown suffix -> NODE_ROLE_GENERIC (4)
+    """
+    suffix = joint_name.split("_")[-1].upper()
+    return JOINT_ROLE_MAP.get(suffix, NODE_ROLE_GENERIC)
+
 
 # -----------------------------------------------------------------------
 # URDF parsing helpers
@@ -78,21 +121,15 @@ class URDFGraphBuilder:
     """
     Parse a URDF once; produce runtime-updated PyG graphs at every RL step.
 
-    The same instance works for any morphology derived from the same URDF.
-    For zero-shot transfer, instantiate a separate builder per morphology
-    and load the same GNN weights -- graph size changes, weights do not.
+    New in this version
+    -------------------
+    - get_graph() now includes data.node_types: LongTensor [num_nodes]
+      containing the NODE_ROLE_* integer for each node.
+      HeteroGNNActorCritic uses this to apply type-specific input projections.
+    - node_roles property exposes the precomputed role list for inspection.
     """
 
     def __init__(self, urdf_path: str, add_body_node: bool = True):
-        """
-        Parameters
-        ----------
-        urdf_path     : path to URDF file
-        add_body_node : add a virtual index-0 node connected to all root joints.
-                        Without this, legs are disconnected graphs -- GNN
-                        message passing cannot coordinate across limbs.
-                        Set False only if you want to ablate this.
-        """
         self.urdf_path     = urdf_path
         self.add_body_node = add_body_node
         self._parse()
@@ -105,7 +142,6 @@ class URDFGraphBuilder:
             j.attrib["name"]: j for j in root.findall("joint")
         }
 
-        # identify root links (no joint has them as a child)
         child_links  = {j.find("child").attrib["link"]  for j in all_joints.values()}
         root_links   = {
             lnk.attrib["name"]
@@ -113,13 +149,11 @@ class URDFGraphBuilder:
             if lnk.attrib["name"] not in child_links
         }
 
-        # parent_link -> [joint names whose parent is that link]
         parent_to_joints: Dict[str, List[str]] = {}
         for jname, j in all_joints.items():
             pl = j.find("parent").attrib["link"]
             parent_to_joints.setdefault(pl, []).append(jname)
 
-        # controllable joints, sorted for deterministic ordering
         ctrl: List[str] = sorted([
             jname for jname, j in all_joints.items()
             if j.attrib.get("type", "fixed") in CONTROLLABLE
@@ -129,6 +163,14 @@ class URDFGraphBuilder:
         self.num_joints   = len(ctrl)
         offset            = 1 if self.add_body_node else 0
         self.joint_to_idx = {name: i + offset for i, name in enumerate(ctrl)}
+
+        # ---- node roles (NEW) --------------------------------------------
+        joint_roles = [_joint_role(jname) for jname in ctrl]
+        if self.add_body_node:
+            all_roles = [NODE_ROLE_BODY] + joint_roles
+        else:
+            all_roles = joint_roles
+        self._node_types = torch.tensor(all_roles, dtype=torch.long)
 
         # ---- static node features ----------------------------------------
         rows = []
@@ -140,19 +182,15 @@ class URDFGraphBuilder:
             oh[jt_id] = 1.0
             rows.append(oh + _xyz(j.find("axis")) + _limits(j))
 
-        joint_static = torch.tensor(rows, dtype=torch.float)   # [J, 10]
+        joint_static = torch.tensor(rows, dtype=torch.float)
 
         if self.add_body_node:
-            # body node: zero static features (no associated joint)
             self._static_x = torch.cat(
                 [torch.zeros(1, STATIC_DIM), joint_static], dim=0
-            )                                                   # [J+1, 10]
+            )
         else:
-            self._static_x = joint_static                      # [J, 10]
+            self._static_x = joint_static
 
-        # normalize ONLY the continuous static features; leave one-hot untouched
-        # columns 4-9: axis(3) + limits(4) -- normalize these
-        # columns 0-3: type one-hot        -- do not normalize
         cont_cols = slice(4, STATIC_DIM)
         col_mean  = self._static_x[:, cont_cols].mean(dim=0, keepdim=True)
         col_std   = self._static_x[:, cont_cols].std(dim=0, keepdim=True).clamp(min=1e-6)
@@ -164,7 +202,6 @@ class URDFGraphBuilder:
         edges:  List[Tuple[int, int]] = []
         efeats: List[List[float]]     = []
 
-        # kinematic chain edges (parent joint -> child joint)
         for jname in ctrl:
             j          = all_joints[jname]
             child_link = j.find("child").attrib["link"]
@@ -172,13 +209,12 @@ class URDFGraphBuilder:
 
             for downstream in parent_to_joints.get(child_link, []):
                 if downstream not in self.joint_to_idx:
-                    continue                                    # skip fixed joints
+                    continue
                 k      = self.joint_to_idx[downstream]
                 origin = _xyz(all_joints[downstream].find("origin"))
                 edges.append((i, k));  efeats.append(origin + [1.0])
                 edges.append((k, i));  efeats.append(origin + [-1.0])
 
-        # body node edges (connects body to every root joint)
         if self.add_body_node:
             body = 0
             for jname in ctrl:
@@ -192,7 +228,6 @@ class URDFGraphBuilder:
 
         if edges:
             self._edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-            # normalize edge origin (cols 0-2); leave direction flag (col 3) alone
             ea = torch.tensor(efeats, dtype=torch.float)
             ea_mean = ea[:, :3].mean(dim=0, keepdim=True)
             ea_std  = ea[:, :3].std(dim=0,  keepdim=True).clamp(min=1e-6)
@@ -208,44 +243,39 @@ class URDFGraphBuilder:
     # ------------------------------------------------------------------
     def _print_summary(self):
         tag = f"body + {self.num_joints} joints" if self.add_body_node else f"{self.num_joints} joints"
+        role_counts = {}
+        for r in self._node_types.tolist():
+            role_counts[r] = role_counts.get(r, 0) + 1
+        role_names = {NODE_ROLE_BODY: "body", NODE_ROLE_HAA: "HAA",
+                      NODE_ROLE_HFE: "HFE", NODE_ROLE_KFE: "KFE",
+                      NODE_ROLE_GENERIC: "generic"}
+        role_str = ", ".join(f"{role_names.get(k,'?')}x{v}" for k, v in sorted(role_counts.items()))
         print(f"\n[URDFGraphBuilder] {self.urdf_path.split('/')[-1]}")
         print(f"  Nodes            : {self.num_nodes}  ({tag})")
+        print(f"  Node roles       : {role_str}")
         print(f"  Edges            : {self._edge_index.shape[1]}  (bidirectional)")
         print(f"  Node feature dim : {NODE_DIM}  (static {STATIC_DIM} + runtime {RUNTIME_DIM})")
         print(f"  Edge feature dim : {EDGE_DIM}")
         print(f"  Action dim       : {self.num_joints}  (one torque per controllable joint)")
         print(f"  Joint order      : {self.joint_names}")
 
+    # ------------------------------------------------------------------
     def get_graph(
         self,
         joint_pos:   Optional[np.ndarray] = None,
         joint_vel:   Optional[np.ndarray] = None,
-        body_quat:   Optional[np.ndarray] = None,  # (qx,qy,qz,qw) -- 4-dim
-        body_grav:   Optional[np.ndarray] = None,  # projected gravity in body frame -- 3-dim
+        body_quat:   Optional[np.ndarray] = None,
+        body_grav:   Optional[np.ndarray] = None,
     ) -> Data:
         """
         Build a PyG Data for one RL timestep.
-
-        joint_pos / joint_vel : shape [num_joints], ordered by self.joint_names
-        body_quat             : base orientation as quaternion (4-dim)
-        body_grav             : gravity vector projected into body frame (3-dim)
-
-        Node runtime layout (9-dim per node):
-          [0]   joint_pos  (0 for body node)
-          [1]   joint_vel  (0 for body node)
-          [2:6] quaternion (actual for body node, zeros for joints)
-          [6:9] gravity    (actual for body node, zeros for joints)
-
-        Giving orientation ONLY to the body node is standard in legged
-        locomotion. The body node propagates this to limb nodes via message
-        passing, so all joints implicitly learn from orientation context.
+        NOW INCLUDES data.node_types for heterogeneous GNN.
         """
         pos  = joint_pos if joint_pos is not None else np.zeros(self.num_joints)
         vel  = joint_vel if joint_vel is not None else np.zeros(self.num_joints)
         quat = body_quat if body_quat is not None else np.array([0., 0., 0., 1.], dtype=np.float32)
         grav = body_grav if body_grav is not None else np.array([0., 0., -1.], dtype=np.float32)
 
-        # Joint nodes: [pos, vel, 0, 0, 0, 0, 0, 0, 0]
         joint_runtime = np.zeros((self.num_joints, RUNTIME_DIM), dtype=np.float32)
         joint_runtime[:, 0] = pos
         joint_runtime[:, 1] = vel
@@ -253,7 +283,6 @@ class URDFGraphBuilder:
         runtime_joints = torch.tensor(joint_runtime, dtype=torch.float)
 
         if self.add_body_node:
-            # Body node: [0, 0, qx, qy, qz, qw, gx, gy, gz]
             body_runtime = np.zeros((1, RUNTIME_DIM), dtype=np.float32)
             body_runtime[0, 2:6] = quat
             body_runtime[0, 6:9] = grav
@@ -263,18 +292,18 @@ class URDFGraphBuilder:
         else:
             runtime = runtime_joints
 
-        x = torch.cat([self._static_x, runtime], dim=1)   # [num_nodes, 20]
+        x = torch.cat([self._static_x, runtime], dim=1)  # [num_nodes, 20]
 
         return Data(
-            x=x,
-            edge_index=self._edge_index.clone(),
-            edge_attr=self._edge_attr.clone(),
+            x          = x,
+            edge_index = self._edge_index.clone(),
+            edge_attr  = self._edge_attr.clone(),
+            node_types = self._node_types.clone(),   # NEW: [num_nodes] LongTensor
         )
 
     # ------------------------------------------------------------------
     @property
     def action_dim(self) -> int:
-        """Number of controllable joints = size of action vector."""
         return self.num_joints
 
     @property
@@ -285,15 +314,16 @@ class URDFGraphBuilder:
     def edge_dim(self) -> int:
         return EDGE_DIM
 
+    @property
+    def node_roles(self) -> torch.Tensor:
+        """Precomputed node role integers. Inspect to verify correctness."""
+        return self._node_types
+
     def obs_to_arrays(
         self,
         pos_dict: Dict[str, float],
         vel_dict: Dict[str, float],
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Convert name->value dicts (e.g. from ROS2 JointState msg) to
-        ordered arrays compatible with get_graph().
-        """
         pos = np.array([pos_dict.get(n, 0.0) for n in self.joint_names])
         vel = np.array([vel_dict.get(n, 0.0) for n in self.joint_names])
         return pos, vel
@@ -313,30 +343,19 @@ if __name__ == "__main__":
     )
 
     rng = np.random.default_rng(42)
+    b   = URDFGraphBuilder(path, add_body_node=True)
 
-    print("=" * 55)
-    print("TEST 1: ANYmal (quadruped)")
-    b = URDFGraphBuilder(path, add_body_node=True)
+    print("\n  node_roles tensor:", b.node_roles.tolist())
+    print("  expected: [0, 1,2,3, 1,2,3, 1,2,3, 1,2,3]  (body, then 4x HAA/HFE/KFE)")
+
     pos = rng.uniform(-0.5,  0.5, b.num_joints)
     vel = rng.uniform(-1.0,  1.0, b.num_joints)
     g   = b.get_graph(pos, vel)
-    print(f"\n  x shape          : {g.x.shape}")
-    print(f"  edge_index shape : {g.edge_index.shape}")
-    print(f"  edge_attr shape  : {g.edge_attr.shape}")
-    assert g.x.shape == (b.num_nodes, NODE_DIM),  "node feature shape mismatch"
-    assert g.edge_attr.shape[1] == EDGE_DIM,       "edge feature shape mismatch"
 
-    print("\nTEST 2: same weights, different step (zero-shot transfer check)")
-    pos2 = rng.uniform(-0.5, 0.5, b.num_joints)
-    vel2 = rng.uniform(-1.0, 1.0, b.num_joints)
-    g2   = b.get_graph(pos2, vel2)
-    assert g2.x.shape == g.x.shape, "graph shape changed between steps -- BUG"
-    print("  OK -- graph shape is stable across steps")
+    assert g.x.shape        == (b.num_nodes, NODE_DIM),  "node feature shape mismatch"
+    assert g.edge_attr.shape[1] == EDGE_DIM,              "edge feature shape mismatch"
+    assert g.node_types.shape   == (b.num_nodes,),        "node_types shape mismatch"
+    assert g.node_types.dtype   == torch.long,            "node_types must be LongTensor"
 
-    print("\nTEST 3: without body node (ablation)")
-    b2 = URDFGraphBuilder(path, add_body_node=False)
-    g3 = b2.get_graph(pos, vel)
-    print(f"  Nodes without body node : {g3.x.shape[0]}  (should be {b2.num_joints})")
-    print(f"  Edges without body node : {g3.edge_index.shape[1]}  (fewer -- legs disconnected)")
-
+    print("\n  graph.node_types:", g.node_types.tolist())
     print("\nAll tests passed.")
