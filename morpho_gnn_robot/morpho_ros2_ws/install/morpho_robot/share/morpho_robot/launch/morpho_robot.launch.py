@@ -28,7 +28,6 @@ Build and source before launching:
 """
 
 import os
-from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -36,17 +35,14 @@ from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     IncludeLaunchDescription,
-    RegisterEventHandler,
     TimerAction,
 )
-from launch.conditions import IfCondition, UnlessCondition
-from launch.event_handlers import OnProcessStart, OnShutdown
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (
     Command,
     LaunchConfiguration,
     PathJoinSubstitution,
-    PythonExpression,
 )
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
@@ -282,6 +278,22 @@ def generate_launch_description():
     )
 
     # -----------------------------------------------------------------------
+    # 5b. Ollama server
+    #     Required by llm_planner_node for local model inference.
+    #     Start before the planner so the first call can connect immediately.
+    # -----------------------------------------------------------------------
+
+    ollama_server = TimerAction(
+        period=1.0,
+        actions=[
+            ExecuteProcess(
+                cmd=["ollama", "serve"],
+                output="screen",
+            )
+        ],
+    )
+
+    # -----------------------------------------------------------------------
     # 6. LLM planner node
     #    Subscribes:  /scene_graph        (std_msgs/String, JSON)
     #    Publishes:   /llm_action         (std_msgs/String, JSON)
@@ -367,7 +379,7 @@ def generate_launch_description():
                 '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/.venv/bin/python',
                 '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/morpho_robot/gnn_policy_node.py',
                 '--checkpoint',
-                '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/Training_Location/checkpoints/gnn_ppo_350208.pt',
+                '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/Training_Location/checkpoints/gnn_ppo_251904.pt',
                 '--urdf',
                 '/mnt/newvolume/Programming/Python/Deep_Learning/'
                 'Relational_Bias_for_Morphological_Generalization/'
@@ -414,8 +426,9 @@ def generate_launch_description():
             spawn_robot,            # +2 s
             gz_bridge,              # +4 s
             vision_node,            # +5 s
-            llm_planner_node,       # +5 s
-            skill_translator_node,  # +5 s
+            ollama_server,          # +1 s
+            #llm_planner_node,       # +5 s
+            #skill_translator_node,  # +5 s
             gnn_policy_node,        # +2.5 s
             rviz,                   # conditional
         ]

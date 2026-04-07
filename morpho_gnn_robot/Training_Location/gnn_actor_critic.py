@@ -92,11 +92,15 @@ class HeteroGNNActorCritic(nn.Module):
         hidden_dim: int = 64,
         num_joints: int = 12,
         num_roles:  int = NUM_NODE_ROLES,
+        log_std_min: float = -2.5,
+        log_std_max: float = 0.0,
     ):
         super().__init__()
         self.num_joints = num_joints
         self.hidden_dim = hidden_dim
         self.num_roles  = num_roles
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
 
         # ---- Type-specific input projections ----------------------------
         # Each role gets its own Linear. No weight sharing BETWEEN roles
@@ -138,7 +142,9 @@ class HeteroGNNActorCritic(nn.Module):
 
         # ---- Critic head (global pool) ----------------------------------
         self.critic_head = nn.Sequential(
-            _layer_init(nn.Linear(hidden_dim, 64)),
+            _layer_init(nn.Linear(hidden_dim, 128)),
+            nn.Tanh(),
+            _layer_init(nn.Linear(128, 64)),
             nn.Tanh(),
             _layer_init(nn.Linear(64, 1), std=1.0),
         )
@@ -187,6 +193,9 @@ class HeteroGNNActorCritic(nn.Module):
         """Extract joint-node embeddings, excluding body node at index 0 per graph."""
         ptr = getattr(data, "ptr", None)
         if ptr is None:
+            assert h.size(0) == self.num_joints + 1, (
+                "Unexpected node count for ptr=None path; expected one body node plus all joints"
+            )
             return h[1:]
         body_mask = torch.zeros(h.size(0), dtype=torch.bool, device=h.device)
         body_mask[ptr[:-1]] = True
@@ -207,7 +216,8 @@ class HeteroGNNActorCritic(nn.Module):
         B       = batch.max().item() + 1
         mean    = mean.view(B, self.num_joints)
 
-        std  = self.log_std.exp().clamp(min=0.01)
+        log_std = self.log_std.clamp(min=self.log_std_min, max=self.log_std_max)
+        std  = log_std.exp().clamp(min=0.01)
         std  = std.unsqueeze(0).expand_as(mean)
         dist = Normal(mean, std)
 
@@ -264,14 +274,14 @@ if __name__ == "__main__":
 
     g = _dummy_graph()
     act, lp, ent, val = agent.get_action_and_value(g)
-    print(f"\nSingle graph:")
+    print("\nSingle graph:")
     print(f"  action   : {act.shape}   expected [1, {N_JOINTS}]")
     print(f"  log_prob : {lp.shape}    expected [1]")
     print(f"  value    : {val.shape}   expected [1, 1]")
 
     batch = Batch.from_data_list([_dummy_graph() for _ in range(8)])
     act_b, lp_b, ent_b, val_b = agent.get_action_and_value(batch)
-    print(f"\nBatched (B=8):")
+    print("\nBatched (B=8):")
     print(f"  action   : {act_b.shape}  expected [8, {N_JOINTS}]")
     print(f"  log_prob : {lp_b.shape}   expected [8]")
     print(f"  value    : {val_b.shape}  expected [8, 1]")

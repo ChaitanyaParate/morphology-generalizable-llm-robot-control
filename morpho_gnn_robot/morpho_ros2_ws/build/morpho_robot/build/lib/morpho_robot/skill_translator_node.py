@@ -37,6 +37,7 @@ class SkillTranslatorNode(Node):
         self.declare_parameter('goal_frame_id', 'base_link')
         self.declare_parameter('camera_half_fov_rad', 0.5236)  # ~30 deg
         self.declare_parameter('stop_distance_m', 0.7)
+        self.declare_parameter('default_forward_goal_m', 1.0)
 
         self.llm_action_topic = self.get_parameter('llm_action_topic').value
         self.scene_graph_topic = self.get_parameter('scene_graph_topic').value
@@ -45,6 +46,7 @@ class SkillTranslatorNode(Node):
         self.goal_frame_id = self.get_parameter('goal_frame_id').value
         self.camera_half_fov_rad = float(self.get_parameter('camera_half_fov_rad').value)
         self.stop_distance_m = float(self.get_parameter('stop_distance_m').value)
+        self.default_forward_goal_m = float(self.get_parameter('default_forward_goal_m').value)
 
         self._latest_scene: Dict[str, Any] = {}
 
@@ -93,6 +95,9 @@ class SkillTranslatorNode(Node):
             goal_xy = self._resolve_goal_from_scene(target)
 
         if goal_xy is None:
+            goal_xy = self._fallback_goal(skill, target)
+
+        if goal_xy is None:
             self.get_logger().warn(
                 f'No goal resolved for target="{target}". '\
                 'Need params {x,y} or a matching object in scene_graph.',
@@ -108,11 +113,22 @@ class SkillTranslatorNode(Node):
         self.skill_pub.publish(out)
 
     def _extract_goal_from_params(self, params: Dict[str, Any]) -> Optional[Tuple[float, float]]:
-        if 'x' in params and 'y' in params:
-            try:
-                return float(params['x']), float(params['y'])
-            except Exception:
-                return None
+        # Accept common coordinate key variants.
+        key_pairs = [('x', 'y'), ('goal_x', 'goal_y'), ('target_x', 'target_y')]
+        for kx, ky in key_pairs:
+            if kx in params and ky in params:
+                try:
+                    return float(params[kx]), float(params[ky])
+                except Exception:
+                    return None
+
+        # Some planner outputs echo scene data inside params.objects.
+        p_objects = params.get('objects')
+        if isinstance(p_objects, list) and p_objects:
+            goal = self._goal_from_object(p_objects[0])
+            if goal is not None:
+                return goal
+
         return None
 
     def _resolve_goal_from_scene(self, target: str) -> Optional[Tuple[float, float]]:
@@ -144,6 +160,9 @@ class SkillTranslatorNode(Node):
             else:
                 obj = candidates[sel]
 
+        return self._goal_from_object(obj)
+
+    def _goal_from_object(self, obj: Dict[str, Any]) -> Optional[Tuple[float, float]]:
         try:
             distance = float(obj.get('distance_m', 0.0))
             bearing = float(obj.get('bearing', 0.0))
@@ -156,6 +175,19 @@ class SkillTranslatorNode(Node):
         x = forward * math.cos(yaw)
         y = forward * math.sin(yaw)
         return x, y
+
+    def _fallback_goal(self, skill: str, target: str) -> Optional[Tuple[float, float]]:
+        # If planner asks for generic navigation without a resolved object,
+        # issue a short forward goal so the policy can keep progressing.
+        s = skill.strip().lower()
+        t = target.strip().lower()
+        if s.startswith('navigate') and t in ('goal', 'forward', ''):
+            self.get_logger().warn(
+                f'Using fallback forward goal: x={self.default_forward_goal_m:.2f}, y=0.00',
+                throttle_duration_sec=3.0,
+            )
+            return self.default_forward_goal_m, 0.0
+        return None
 
     def _publish_goal_pose(self, x: float, y: float) -> None:
         yaw = math.atan2(y, x) if abs(x) + abs(y) > 1e-6 else 0.0

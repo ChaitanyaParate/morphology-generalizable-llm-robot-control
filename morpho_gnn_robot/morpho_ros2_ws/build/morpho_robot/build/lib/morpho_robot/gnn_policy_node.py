@@ -8,6 +8,17 @@ Subscribes  : /joint_states          (sensor_msgs/JointState)
 Publishes   : /model/robot/joint/*/cmd_pos (std_msgs/Float64)
 Control Hz  : 20 Hz (timer-driven, non-blocking)
 
+Current training architecture (train_gnn_ppo.py v2)
+----------------------------------------------------
+- Actor/Critic LR split: actor=3e-4, critic=1e-3, GNN=1e-3
+  (faster critic convergence, shared GNN features for value fitting)
+- Critic head: deeper network 64→128→64→1 (was 64→1) for better value fitting
+- Critic weight decay: 0.0 (allow unrestricted convergence)
+- vf_coef: 1.0 (critic loss has equal weight to policy loss)
+- FALL_PENALTY: 100.0 (strong upright incentive)
+- num_minibatches: 2 (large minibatches for lower gradient variance)
+- clip_vloss: False (unclipped value loss for large corrections)
+
 Bugs fixed vs first version
 ----------------------------
 1. GNNActorCritic constructor used wrong kwarg names (node_feature_dim etc.)
@@ -130,13 +141,17 @@ class GNNPolicyNode(Node):
 
         # Instantiate with the EXACT same args used in train_gnn_ppo.py:
         #   GNNActorCritic(
-        #       node_dim   = builder.node_dim,    # 13
-        #       edge_dim   = builder.edge_dim,    # 4
+        #       node_dim   = builder.node_dim,    # 20 (joint states, normalized)
+        #       edge_dim   = builder.edge_dim,    # 4 (kinematic features)
         #       hidden_dim = cfg.hidden_dim,      # 64 (default in Config)
-        #       num_joints = builder.action_dim,  # 12
+        #       num_joints = builder.action_dim,  # 12 controllable joints
         #   )
+        # Current architecture (v2):
+        #   - HeteroGNNActorCritic with role-specific input projections
+        #   - Critic head: 64→128→64→1 (deeper for better value fitting)
+        #   - Trained with actor/critic LR split + GNN at critic speed
         model = GNNActorCritic(
-            node_dim   = self.builder.node_dim,    # 13  (STATIC_DIM=11 + RUNTIME_DIM=2)
+            node_dim   = self.builder.node_dim,    # 20
             edge_dim   = self.builder.edge_dim,    # 4
             hidden_dim = HIDDEN_DIM,               # 64 -- change if you overrode this
             num_joints = self.builder.action_dim,  # 12
@@ -152,7 +167,47 @@ class GNNPolicyNode(Node):
                 # Bare state dict (e.g. saved with torch.save(model.state_dict(), path))
                 state = raw
                 self.get_logger().info("Bare state dict checkpoint")
-            model.load_state_dict(state, strict=True)
+
+            # Backward-compatible load: keep only keys that exist and match shape.
+            model_state = model.state_dict()
+            filtered_state = {}
+            skipped_missing = []
+            skipped_shape = []
+
+            for key, value in state.items():
+                if key not in model_state:
+                    skipped_missing.append(key)
+                    continue
+                if model_state[key].shape != value.shape:
+                    skipped_shape.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+                    continue
+                filtered_state[key] = value
+
+            load_result = model.load_state_dict(filtered_state, strict=False)
+
+            self.get_logger().info(
+                f"Loaded {len(filtered_state)}/{len(model_state)} model tensors from checkpoint"
+            )
+            if skipped_missing:
+                self.get_logger().warn(
+                    f"Skipped {len(skipped_missing)} unknown checkpoint keys"
+                )
+            if skipped_shape:
+                self.get_logger().warn(
+                    f"Skipped {len(skipped_shape)} shape-mismatched checkpoint keys"
+                )
+                for key, ckpt_shape, model_shape in skipped_shape[:10]:
+                    self.get_logger().warn(
+                        f"  {key}: ckpt={ckpt_shape}, model={model_shape}"
+                    )
+                if len(skipped_shape) > 10:
+                    self.get_logger().warn(
+                        f"  ... and {len(skipped_shape) - 10} more"
+                    )
+            if load_result.missing_keys:
+                self.get_logger().info(
+                    f"Model has {len(load_result.missing_keys)} missing keys after load (expected for newer layers)"
+                )
 
         elif isinstance(raw, GNNActorCritic):
             # Full model object saved with torch.save(model, path)
