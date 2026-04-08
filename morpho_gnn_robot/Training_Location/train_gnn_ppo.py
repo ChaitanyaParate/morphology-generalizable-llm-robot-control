@@ -20,7 +20,7 @@ import argparse
 import os
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List
 
 import numpy as np
@@ -83,18 +83,20 @@ class Config:
 
     # Training
     seed:             int   = 0
-    total_timesteps:  int   = 500_000
-    learning_rate:    float = 1e-4
-    num_steps:        int   = 2048    # rollout length before each update
-    num_minibatches:  int   = 32
-    update_epochs:    int   = 10
+    total_timesteps:  int   = 5_000_000
+    gnn_learning_rate:    float = 3e-4
+    actor_learning_rate:  float = 1e-3
+    critic_learning_rate: float = 1e-3
+    num_steps:        int   = 4096    # rollout length before each update
+    num_minibatches:  int   = 4
+    update_epochs:    int   = 8
     gamma:            float = 0.99
     gae_lambda:       float = 0.95
-    clip_coef:        float = 0.2
-    ent_coef:         float = 0.00005   # low: let pg signal dominate; entropy is already high at init
+    clip_coef:        float = 0.25
+    ent_coef:         float = 0.005   # encourage exploration and avoid entropy collapse
     vf_coef:          float = 1.0
     max_grad_norm:    float = 0.5
-    clip_vloss:       bool  = True
+    clip_vloss:       bool  = False
     resume_path: str = None
 
     # GNN
@@ -103,8 +105,13 @@ class Config:
     # Logging
     track:       bool = False    # set True on Kaggle with wandb key
     run_name:    str  = ""
-    save_every:  int  = 50_000   # checkpoint every N timesteps
+    save_every:  int  = 70_000   # checkpoint every N timesteps
     checkpoint_dir: str = "./checkpoints"
+
+    # Warmup (stability-first) reward scaling
+    warmup_steps: int = 0
+    warmup_forward_scale: float = 1.0
+    warmup_stability_scale: float = 1.0
 
     @property
     def minibatch_size(self):
@@ -232,7 +239,25 @@ def train(cfg: Config):
         num_joints = builder.action_dim,
     ).to(device)
 
-    optimizer = optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=1e-5)
+    gnn_params = (
+        list(agent.type_proj.parameters()) +
+        list(agent.conv1.parameters()) +
+        list(agent.norm1.parameters()) +
+        list(agent.conv2.parameters()) +
+        list(agent.norm2.parameters())
+    )
+    actor_params = list(agent.actor_head.parameters()) + [agent.log_std]
+    critic_params = list(agent.critic_head.parameters())
+
+    optimizer = optim.Adam(
+        [
+            {"params": gnn_params, "lr": cfg.gnn_learning_rate},
+            {"params": actor_params, "lr": cfg.actor_learning_rate},
+            {"params": critic_params, "lr": cfg.critic_learning_rate},
+        ],
+        eps=1e-5,
+    )
+    base_lrs = [pg["lr"] for pg in optimizer.param_groups]
 
     start_global_step = 0
 
@@ -240,7 +265,12 @@ def train(cfg: Config):
         print(f"\nLoading checkpoint: {cfg.resume_path}")
         checkpoint = torch.load(cfg.resume_path, map_location=device, weights_only=False)
         agent.load_state_dict(checkpoint["agent"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        if "optimizer" in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+                base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+            except Exception as exc:
+                print(f"Warning: could not load optimizer state ({exc}). Using fresh optimizer.")
         start_global_step = checkpoint.get("global_step", 0)
         episode_rewards   = checkpoint.get("episode_rewards", [])
         if "obs_norm_mean" in checkpoint:
@@ -280,7 +310,8 @@ def train(cfg: Config):
         # ---- learning rate annealing ----
         frac = 1.0 - (global_step - start_global_step) / (cfg.total_timesteps - start_global_step)
         frac = max(frac, 0.0)
-        optimizer.param_groups[0]["lr"] = frac * cfg.learning_rate
+        for base_lr, pg in zip(base_lrs, optimizer.param_groups):
+            pg["lr"] = frac * base_lr
 
         # --------------------------------------------------------
         # Rollout collection
@@ -290,6 +321,22 @@ def train(cfg: Config):
         for step in range(cfg.num_steps):
             global_step += 1
             ep_length   += 1
+
+            if cfg.warmup_steps > 0:
+                warmup_progress = min(
+                    (global_step - start_global_step) / cfg.warmup_steps,
+                    1.0,
+                )
+                forward_scale = cfg.warmup_forward_scale + warmup_progress * (
+                    1.0 - cfg.warmup_forward_scale
+                )
+                stability_scale = cfg.warmup_stability_scale + warmup_progress * (
+                    1.0 - cfg.warmup_stability_scale
+                )
+                env.set_reward_scales(
+                    forward_scale=forward_scale,
+                    stability_scale=stability_scale,
+                )
 
             # Normalize only joint states (dims 0-30); orientation dims are raw
             obs_norm.update(obs[:OBS_NORM_DIM])
@@ -345,6 +392,7 @@ def train(cfg: Config):
 
         pg_losses, vf_losses, ent_losses = [], [], []
         clip_fracs = []
+        approx_kls = []
 
         for epoch in range(cfg.update_epochs):
             np.random.shuffle(indices)
@@ -372,6 +420,7 @@ def train(cfg: Config):
                     clip_fracs.append(
                         ((ratio - 1.0).abs() > cfg.clip_coef).float().mean().item()
                     )
+                    approx_kls.append(((ratio - 1.0) - logratio).mean().item())
 
                 # policy loss
                 pg_loss1 = -mb_adv * ratio
@@ -403,10 +452,19 @@ def train(cfg: Config):
                 vf_losses.append(vf_loss.item())
                 ent_losses.append(ent_loss.item())
 
+        # Critic fit quality: how much return variance is explained by value preds.
+        # 1.0 is perfect, ~0 means little predictive power, <0 is very poor.
+        y_pred = buffer.values.cpu().numpy()
+        y_true = returns.cpu().numpy()
+        y_var = np.var(y_true)
+        explained_var = np.nan if y_var == 0 else 1.0 - np.var(y_true - y_pred) / y_var
+
         # --------------------------------------------------------
         # Logging
         # --------------------------------------------------------
-        sps = int(global_step / (time.time() - start_time))
+        elapsed = max(time.time() - start_time, 1e-8)
+        run_steps = global_step - start_global_step
+        sps = int(run_steps / elapsed)
 
         if episode_rewards:
             mean_ep_rew = np.mean(episode_rewards[-20:])
@@ -423,6 +481,11 @@ def train(cfg: Config):
             f"vf={np.mean(vf_losses):>7.4f} | "
             f"ent={np.mean(ent_losses):>6.4f} | "
             f"clip={np.mean(clip_fracs):.3f} | "
+            f"kl={np.mean(approx_kls):.5f} | "
+            f"ev={explained_var:>6.3f} | "
+            f"lr_g={optimizer.param_groups[0]['lr']:.2e} | "
+            f"lr_a={optimizer.param_groups[1]['lr']:.2e} | "
+            f"lr_c={optimizer.param_groups[2]['lr']:.2e} | "
             f"sps={sps}"
         )
 
@@ -435,8 +498,12 @@ def train(cfg: Config):
                 "losses/value_loss":       np.mean(vf_losses),
                 "losses/entropy":          np.mean(ent_losses),
                 "charts/clip_frac":        np.mean(clip_fracs),
+                "losses/approx_kl":        np.mean(approx_kls),
+                "losses/explained_variance": explained_var,
                 "charts/sps":              sps,
-                "charts/learning_rate":    optimizer.param_groups[0]["lr"],
+                "charts/learning_rate_gnn":    optimizer.param_groups[0]["lr"],
+                "charts/learning_rate_actor":  optimizer.param_groups[1]["lr"],
+                "charts/learning_rate_critic": optimizer.param_groups[2]["lr"],
             }, step=global_step)
 
         # checkpoint

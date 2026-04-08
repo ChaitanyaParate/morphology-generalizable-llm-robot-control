@@ -134,7 +134,7 @@ class HeteroGNNActorCritic(nn.Module):
             nn.Tanh(),
             _layer_init(nn.Linear(64, 1), std=0.01),
         )
-        self.log_std = nn.Parameter(torch.full((num_joints,), -1.0))
+        self.log_std = nn.Parameter(torch.full((num_joints,), -0.7))
 
         # ---- Critic head (global pool) ----------------------------------
         self.critic_head = nn.Sequential(
@@ -207,7 +207,7 @@ class HeteroGNNActorCritic(nn.Module):
         B       = batch.max().item() + 1
         mean    = mean.view(B, self.num_joints)
 
-        std  = self.log_std.exp().clamp(min=0.01)
+        std  = self.log_std.exp().clamp(min=0.15, max=0.8)
         std  = std.unsqueeze(0).expand_as(mean)
         dist = Normal(mean, std)
 

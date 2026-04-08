@@ -4,7 +4,7 @@ robot_env_bullet.py
 Gym environment for legged robot locomotion using PyBullet DIRECT mode.
 Designed for Kaggle headless training -- no display, no GUI.
 
-Observation layout (flat, 30-dim):
+Observation layout (flat, 37-dim):
   [0:12]  joint positions   (rad)
   [12:24] joint velocities  (rad/s)
   [24:27] base linear  velocity (m/s)
@@ -17,9 +17,6 @@ Both sort alphabetically -- they will always agree.
 Action: 12-dim in [-1, 1]. Scaled by effort_limit inside step().
 """
 
-
-import os
-import time
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -63,7 +60,7 @@ class RobotEnvBullet(gym.Env):
     # making τ² sum ~67,500 per step. At 1e-4 that is -6.75 per step, -6750
     # over 1000 steps. The agent learns to do nothing to minimize torque cost
     # rather than walk. Remove it until locomotion emerges; add back later.
-    FALL_PENALTY = 10.0    # one-time penalty, small enough not to dominate
+    FALL_PENALTY = 200.0
 
     def __init__(
         self,
@@ -119,6 +116,8 @@ class RobotEnvBullet(gym.Env):
         self._step_count  = 0
         self._fell        = False
         self.prev_action = np.zeros(self.action_dim)
+        self.forward_reward_scale = 1.0
+        self.stability_bonus_scale = 1.0
 
     # ------------------------------------------------------------------
     def _parse_urdf(self):
@@ -166,8 +165,6 @@ class RobotEnvBullet(gym.Env):
         for i in range(num_joints):
             info = p.getJointInfo(robot_id, i)
             name  = info[1].decode("utf-8")
-            jtype = info[2]   # 0=revolute, 1=prismatic, 4=fixed
-
             if name in self.joint_names:
                 self._joint_idx[name] = i
                 # CRITICAL: disable default position control motor
@@ -250,6 +247,13 @@ class RobotEnvBullet(gym.Env):
         return obs, {}
 
     # ------------------------------------------------------------------
+    def set_reward_scales(self, forward_scale: float = None, stability_scale: float = None):
+        if forward_scale is not None:
+            self.forward_reward_scale = float(forward_scale)
+        if stability_scale is not None:
+            self.stability_bonus_scale = float(stability_scale)
+
+    # ------------------------------------------------------------------
     def step(self, action: np.ndarray):
         """
         action : [num_joints] in [-1, 1]
@@ -316,7 +320,7 @@ class RobotEnvBullet(gym.Env):
 
         # --- termination ---
         self._fell = base_height < 0.20
-        bad_orientation = abs(roll) > 0.8 or abs(pitch) > 0.8
+        bad_orientation = abs(roll) > 0.6 or abs(pitch) > 0.6
 
         terminated = self._fell or bad_orientation
         truncated  = self._step_count >= self.max_episode_steps
@@ -366,17 +370,23 @@ class RobotEnvBullet(gym.Env):
         forward_vel = float(lin_vel[self.forward_axis])
         lateral_vel = float(lin_vel[1 - self.forward_axis])
 
-        # NO alive bonus -- it creates a local optimum where the policy learns
-        # to stand still and collect it rather than walk. The ONLY path to
-        # positive reward is forward_vel > 0.
-        target_vel = 0.6
-        vel_error = (forward_vel - target_vel)
+        yaw_rate = float(obs[29])
+        forward_vel_pos = max(0.0, forward_vel)
+        r_vel = np.clip(forward_vel_pos, 0.0, 2.0) * 8.0 * self.forward_reward_scale
+        stall_penalty = -0.5 * max(0.0, 0.25 - forward_vel_pos) * self.forward_reward_scale
+        # Early-training stability bonuses: encourage upright stance and height.
+        upright_bonus = np.exp(-2.0 * (roll**2 + pitch**2))
+        height_bonus = np.clip((base_height - 0.30) / 0.20, 0.0, 1.0)
+        stability_bonus = self.stability_bonus_scale * (0.5 * upright_bonus + 0.5 * height_bonus)
         r = (
-            10.0 * np.exp(-vel_error**2)   # ONLY reward forward
-            - 1.0 * abs(lateral_vel)
-            - 2.0 * (roll**2 + pitch**2)
-            - 2.0 * max(0.0, 0.45 - base_height)
-            - 0.02 * smooth_penalty
+            r_vel
+            + stall_penalty
+            + stability_bonus
+            - 0.5 * abs(lateral_vel)
+            - 0.75 * (yaw_rate ** 2)
+            - 1.0 * (roll**2 + pitch**2)
+            - 1.0 * max(0.0, 0.40 - base_height)
+            - 0.01 * smooth_penalty
         )
 
         return float(r)
@@ -403,7 +413,7 @@ if __name__ == "__main__":
 
     print(f"  Joint names     : {env.joint_names}")
     print(f"  Effort limits   : {env.effort_limits}")
-    print(f"  Obs shape       : {obs.shape}  expected (30,)")
+    print(f"  Obs shape       : {obs.shape}  expected (37,)")
     print(f"  Action dim      : {env.action_dim}  expected 12")
 
     total_reward = 0.0

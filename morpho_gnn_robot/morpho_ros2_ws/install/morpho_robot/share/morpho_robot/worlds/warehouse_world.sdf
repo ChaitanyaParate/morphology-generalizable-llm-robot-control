@@ -34,10 +34,24 @@
 
 </plugin>
 
-    <!-- Sun -->
-    <include>
-      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Sun</uri>
-    </include>
+    <scene>
+      <ambient>0.4 0.4 0.4 1</ambient>
+      <background>0.7 0.7 0.7 1</background>
+    </scene>
+
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>1 1 1 1</diffuse>
+      <specular>0.5 0.5 0.5 1</specular>
+      <attenuation>
+        <range>100</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.5 -1</direction>
+    </light>
 
 <!-- White floor -->
 <model name="white_floor">
@@ -64,9 +78,10 @@
       </geometry>
 
       <material>
-        <ambient>1 1 1 1</ambient>
-        <diffuse>1 1 1 1</diffuse>
-        <specular>0.1 0.1 0.1 1</specular>
+        <script>
+          <uri>file://media/materials/scripts/gazebo.material</uri>
+          <name>Gazebo/Grey</name>
+        </script>
       </material>
 
     </visual>
@@ -333,6 +348,7 @@
           <material>
             <ambient>1 0 0 1</ambient>
             <diffuse>1 0 0 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
           </material>
         </visual>
       </link>
@@ -350,6 +366,7 @@
           <material>
             <ambient>0 0 1 1</ambient>
             <diffuse>0 0 1 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
           </material>
         </visual>
       </link>
@@ -367,6 +384,7 @@
           <material>
             <ambient>0 1 0 1</ambient>
             <diffuse>0 1 0 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
           </material>
         </visual>
       </link>
@@ -384,6 +402,7 @@
           <material>
             <ambient>1 1 0 1</ambient>
             <diffuse>1 1 0 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
           </material>
         </visual>
       </link>

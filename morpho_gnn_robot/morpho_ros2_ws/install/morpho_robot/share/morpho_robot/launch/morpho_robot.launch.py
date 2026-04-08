@@ -367,7 +367,7 @@ def generate_launch_description():
                 '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/.venv/bin/python',
                 '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/morpho_robot/gnn_policy_node.py',
                 '--checkpoint',
-                '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/Training_Location/checkpoints/gnn_ppo_350208.pt',
+                '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/Training_Location/checkpoints/gnn_ppo_808960.pt',
                 '--urdf',
                 '/mnt/newvolume/Programming/Python/Deep_Learning/'
                 'Relational_Bias_for_Morphological_Generalization/'
