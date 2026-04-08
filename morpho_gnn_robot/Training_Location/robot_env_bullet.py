@@ -34,6 +34,14 @@ CONTROLLABLE = {"revolute", "continuous", "prismatic"}
 KP = 150.0
 KD = 5.0
 
+# Contact/friction tuning
+PLANE_LATERAL_FRICTION = 1.2
+PLANE_SPINNING_FRICTION = 0.05
+PLANE_ROLLING_FRICTION = 0.001
+LINK_LATERAL_FRICTION = 1.2
+LINK_SPINNING_FRICTION = 0.03
+LINK_ROLLING_FRICTION = 0.001
+
 # ANYmal nominal standing pose -- front and hind legs have OPPOSITE sign conventions
 NOMINAL_POSE_PER_JOINT = {
     "LF_HAA":  0.0,  "LF_HFE":  0.6,  "LF_KFE": -1.2,
@@ -201,14 +209,20 @@ class RobotEnvBullet(gym.Env):
                 self._robot_id,
                 i,
                 linearDamping=0.04,
-                angularDamping=0.04
+                angularDamping=0.04,
+                lateralFriction=LINK_LATERAL_FRICTION,
+                spinningFriction=LINK_SPINNING_FRICTION,
+                rollingFriction=LINK_ROLLING_FRICTION,
             )
 
         p.changeDynamics(
             self._robot_id,
             -1,  # base link
             linearDamping=0.04,
-            angularDamping=0.04
+            angularDamping=0.04,
+            lateralFriction=LINK_LATERAL_FRICTION,
+            spinningFriction=LINK_SPINNING_FRICTION,
+            rollingFriction=LINK_ROLLING_FRICTION,
         )
 
 
@@ -220,7 +234,15 @@ class RobotEnvBullet(gym.Env):
         self._robot_id = None   # resetSimulation already removed all bodies
         p.setGravity(0, 0, -9.81)
         p.setTimeStep(1.0 / 240.0)
-        p.loadURDF("plane.urdf")
+        p.setPhysicsEngineParameter(numSolverIterations=50, numSubSteps=1)
+        plane_id = p.loadURDF("plane.urdf")
+        p.changeDynamics(
+            plane_id,
+            -1,
+            lateralFriction=PLANE_LATERAL_FRICTION,
+            spinningFriction=PLANE_SPINNING_FRICTION,
+            rollingFriction=PLANE_ROLLING_FRICTION,
+        )
 
         self._load_robot()
 
@@ -297,7 +319,7 @@ class RobotEnvBullet(gym.Env):
                 force=float(torque)
             )
 
-        for _ in range(4):
+        for _ in range(2):
             p.stepSimulation()
 
         self._step_count += 1
@@ -372,7 +394,7 @@ class RobotEnvBullet(gym.Env):
 
         yaw_rate = float(obs[29])
         forward_vel_pos = max(0.0, forward_vel)
-        r_vel = np.clip(forward_vel_pos, 0.0, 2.0) * 8.0 * self.forward_reward_scale
+        r_vel = np.clip(forward_vel_pos, 0.0, 2.0) * 16.0 * self.forward_reward_scale
         stall_penalty = -0.5 * max(0.0, 0.25 - forward_vel_pos) * self.forward_reward_scale
         # Early-training stability bonuses: encourage upright stance and height.
         upright_bonus = np.exp(-2.0 * (roll**2 + pitch**2))
