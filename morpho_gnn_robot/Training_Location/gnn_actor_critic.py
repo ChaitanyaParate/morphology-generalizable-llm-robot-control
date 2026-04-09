@@ -60,7 +60,7 @@ class HeteroGNNActorCritic(nn.Module):
     """
     Parameters
     ----------
-    node_dim    : raw node feature dim from URDFGraphBuilder  (20 for ANYmal)
+    node_dim    : raw node feature dim from URDFGraphBuilder  (26 for ANYmal)
     edge_dim    : edge feature dim                            (4)
     hidden_dim  : projected/GNN hidden size                   (64)
     num_joints  : number of controllable joints               (12 for ANYmal)
@@ -68,9 +68,9 @@ class HeteroGNNActorCritic(nn.Module):
 
     Architecture
     ------------
-    [raw node features, 20-dim]
-          |
-    type_proj[role]   <- one Linear(20, hidden_dim) per role, no weight sharing
+        [raw node features, 26-dim]
+            |
+        type_proj[role]   <- one Linear(26, hidden_dim) per role, no weight sharing
           |                 body, HAA, HFE, KFE, generic each get their own
     [projected, hidden_dim]  <- all nodes now in same latent space
           |
@@ -238,7 +238,7 @@ GNNActorCritic = HeteroGNNActorCritic
 if __name__ == "__main__":
     from torch_geometric.data import Batch
 
-    NODE_DIM = 20   # updated: was 13 before body orientation was added
+    NODE_DIM = 26   # updated: was 20 before base velocity was added
     EDGE_DIM = 4
     N_JOINTS = 12
     N_NODES  = 13   # 1 body + 12 joints
@@ -264,14 +264,14 @@ if __name__ == "__main__":
 
     g = _dummy_graph()
     act, lp, ent, val = agent.get_action_and_value(g)
-    print(f"\nSingle graph:")
+    print("\nSingle graph:")
     print(f"  action   : {act.shape}   expected [1, {N_JOINTS}]")
     print(f"  log_prob : {lp.shape}    expected [1]")
     print(f"  value    : {val.shape}   expected [1, 1]")
 
     batch = Batch.from_data_list([_dummy_graph() for _ in range(8)])
     act_b, lp_b, ent_b, val_b = agent.get_action_and_value(batch)
-    print(f"\nBatched (B=8):")
+    print("\nBatched (B=8):")
     print(f"  action   : {act_b.shape}  expected [8, {N_JOINTS}]")
     print(f"  log_prob : {lp_b.shape}   expected [8]")
     print(f"  value    : {val_b.shape}  expected [8, 1]")

@@ -4,7 +4,7 @@ robot_env_bullet.py
 Gym environment for legged robot locomotion using PyBullet DIRECT mode.
 Designed for Kaggle headless training -- no display, no GUI.
 
-Observation layout (flat, 30-dim):
+Observation layout (flat, 37-dim):
   [0:12]  joint positions   (rad)
   [12:24] joint velocities  (rad/s)
   [24:27] base linear  velocity (m/s)
@@ -17,9 +17,6 @@ Both sort alphabetically -- they will always agree.
 Action: 12-dim in [-1, 1]. Scaled by effort_limit inside step().
 """
 
-
-import os
-import time
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -36,6 +33,14 @@ CONTROLLABLE = {"revolute", "continuous", "prismatic"}
 # PD gains -- higher stiffness needed to hold ANYmal against gravity
 KP = 150.0
 KD = 5.0
+
+# Contact/friction tuning
+PLANE_LATERAL_FRICTION = 1.3
+PLANE_SPINNING_FRICTION = 0.05
+PLANE_ROLLING_FRICTION = 0.001
+LINK_LATERAL_FRICTION = 1.3
+LINK_SPINNING_FRICTION = 0.03
+LINK_ROLLING_FRICTION = 0.001
 
 # ANYmal nominal standing pose -- front and hind legs have OPPOSITE sign conventions
 NOMINAL_POSE_PER_JOINT = {
@@ -63,7 +68,7 @@ class RobotEnvBullet(gym.Env):
     # making τ² sum ~67,500 per step. At 1e-4 that is -6.75 per step, -6750
     # over 1000 steps. The agent learns to do nothing to minimize torque cost
     # rather than walk. Remove it until locomotion emerges; add back later.
-    FALL_PENALTY = 10.0    # one-time penalty, small enough not to dominate
+    FALL_PENALTY = 150.0
 
     def __init__(
         self,
@@ -166,8 +171,6 @@ class RobotEnvBullet(gym.Env):
         for i in range(num_joints):
             info = p.getJointInfo(robot_id, i)
             name  = info[1].decode("utf-8")
-            jtype = info[2]   # 0=revolute, 1=prismatic, 4=fixed
-
             if name in self.joint_names:
                 self._joint_idx[name] = i
                 # CRITICAL: disable default position control motor
@@ -204,14 +207,20 @@ class RobotEnvBullet(gym.Env):
                 self._robot_id,
                 i,
                 linearDamping=0.04,
-                angularDamping=0.04
+                angularDamping=0.04,
+                lateralFriction=LINK_LATERAL_FRICTION,
+                spinningFriction=LINK_SPINNING_FRICTION,
+                rollingFriction=LINK_ROLLING_FRICTION,
             )
 
         p.changeDynamics(
             self._robot_id,
             -1,  # base link
             linearDamping=0.04,
-            angularDamping=0.04
+            angularDamping=0.04,
+            lateralFriction=LINK_LATERAL_FRICTION,
+            spinningFriction=LINK_SPINNING_FRICTION,
+            rollingFriction=LINK_ROLLING_FRICTION,
         )
 
 
@@ -223,7 +232,15 @@ class RobotEnvBullet(gym.Env):
         self._robot_id = None   # resetSimulation already removed all bodies
         p.setGravity(0, 0, -9.81)
         p.setTimeStep(1.0 / 240.0)
-        p.loadURDF("plane.urdf")
+        p.setPhysicsEngineParameter(numSolverIterations=50, numSubSteps=1)
+        plane_id = p.loadURDF("plane.urdf")
+        p.changeDynamics(
+            plane_id,
+            -1,
+            lateralFriction=PLANE_LATERAL_FRICTION,
+            spinningFriction=PLANE_SPINNING_FRICTION,
+            rollingFriction=PLANE_ROLLING_FRICTION,
+        )
 
         self._load_robot()
 
@@ -272,7 +289,7 @@ class RobotEnvBullet(gym.Env):
         # Now orientation (gravity vector) is in obs so the policy can
         # stabilize while learning to walk. 0.35 gives locomotion range
         # without producing joint limit violations.
-        target_pos = self._nominal_pos + action * 0.35
+        target_pos = self._nominal_pos + action * 0.45
 
         smooth_penalty = np.sum((action - self.prev_action) ** 2)
         self.prev_action = action.copy()
@@ -293,7 +310,7 @@ class RobotEnvBullet(gym.Env):
                 force=float(torque)
             )
 
-        for _ in range(4):
+        for _ in range(2):
             p.stepSimulation()
 
         self._step_count += 1
@@ -357,28 +374,30 @@ class RobotEnvBullet(gym.Env):
         return np.concatenate([joint_pos, joint_vel, lin_vel, ang_vel, quat, gravity_body])
 
     # ------------------------------------------------------------------
-    def _compute_reward(self, obs: np.ndarray, torques: np.ndarray, smooth_penalty: float, base_height: float) -> float:
-        lin_vel  = obs[24:27]
-
+    def _compute_reward(self, obs, torques, smooth_penalty, base_height):
+        lin_vel = obs[24:27]
         base_pos, base_orn = p.getBasePositionAndOrientation(self._robot_id)
-        roll, pitch, _     = p.getEulerFromQuaternion(base_orn)
+        roll, pitch, _ = p.getEulerFromQuaternion(base_orn)
 
         forward_vel = float(lin_vel[self.forward_axis])
         lateral_vel = float(lin_vel[1 - self.forward_axis])
+        yaw_rate    = float(obs[29])
 
-        # NO alive bonus -- it creates a local optimum where the policy learns
-        # to stand still and collect it rather than walk. The ONLY path to
-        # positive reward is forward_vel > 0.
-        target_vel = 0.6
-        vel_error = (forward_vel - target_vel)
+        # Stronger forward-drive reward to break stand-still local optimum.
+        r_vel = float(np.clip(forward_vel * 20.0, -6.0, 24.0))
+
+        # Scale penalties with speed so early exploration is not over-penalized.
+        speed_gate = float(np.clip(abs(forward_vel) / 0.6, 0.0, 1.0))
+        penalty_scale = 0.30 + 0.70 * speed_gate
+
         r = (
-            10.0 * np.exp(-vel_error**2)   # ONLY reward forward
-            - 1.0 * abs(lateral_vel)
-            - 2.0 * (roll**2 + pitch**2)
-            - 2.0 * max(0.0, 0.45 - base_height)
-            - 0.02 * smooth_penalty
+            r_vel
+            - penalty_scale * 0.20 * abs(lateral_vel)
+            - penalty_scale * 0.15 * (yaw_rate ** 2)
+            - penalty_scale * 0.25 * (roll**2 + pitch**2)
+            - penalty_scale * 0.15 * max(0.0, 0.40 - base_height)
+            - penalty_scale * 0.0015 * smooth_penalty
         )
-
         return float(r)
 
     # ------------------------------------------------------------------
@@ -403,7 +422,7 @@ if __name__ == "__main__":
 
     print(f"  Joint names     : {env.joint_names}")
     print(f"  Effort limits   : {env.effort_limits}")
-    print(f"  Obs shape       : {obs.shape}  expected (30,)")
+    print(f"  Obs shape       : {obs.shape}  expected (37,)")
     print(f"  Action dim      : {env.action_dim}  expected 12")
 
     total_reward = 0.0

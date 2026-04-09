@@ -35,10 +35,10 @@ KP = 150.0
 KD = 5.0
 
 # Contact/friction tuning
-PLANE_LATERAL_FRICTION = 1.2
+PLANE_LATERAL_FRICTION = 1.3
 PLANE_SPINNING_FRICTION = 0.05
 PLANE_ROLLING_FRICTION = 0.001
-LINK_LATERAL_FRICTION = 1.2
+LINK_LATERAL_FRICTION = 1.3
 LINK_SPINNING_FRICTION = 0.03
 LINK_ROLLING_FRICTION = 0.001
 
@@ -68,7 +68,7 @@ class RobotEnvBullet(gym.Env):
     # making τ² sum ~67,500 per step. At 1e-4 that is -6.75 per step, -6750
     # over 1000 steps. The agent learns to do nothing to minimize torque cost
     # rather than walk. Remove it until locomotion emerges; add back later.
-    FALL_PENALTY = 200.0
+    FALL_PENALTY = 150.0
 
     def __init__(
         self,
@@ -124,8 +124,6 @@ class RobotEnvBullet(gym.Env):
         self._step_count  = 0
         self._fell        = False
         self.prev_action = np.zeros(self.action_dim)
-        self.forward_reward_scale = 1.0
-        self.stability_bonus_scale = 1.0
 
     # ------------------------------------------------------------------
     def _parse_urdf(self):
@@ -269,13 +267,6 @@ class RobotEnvBullet(gym.Env):
         return obs, {}
 
     # ------------------------------------------------------------------
-    def set_reward_scales(self, forward_scale: float = None, stability_scale: float = None):
-        if forward_scale is not None:
-            self.forward_reward_scale = float(forward_scale)
-        if stability_scale is not None:
-            self.stability_bonus_scale = float(stability_scale)
-
-    # ------------------------------------------------------------------
     def step(self, action: np.ndarray):
         """
         action : [num_joints] in [-1, 1]
@@ -298,7 +289,7 @@ class RobotEnvBullet(gym.Env):
         # Now orientation (gravity vector) is in obs so the policy can
         # stabilize while learning to walk. 0.35 gives locomotion range
         # without producing joint limit violations.
-        target_pos = self._nominal_pos + action * 0.35
+        target_pos = self._nominal_pos + action * 0.45
 
         smooth_penalty = np.sum((action - self.prev_action) ** 2)
         self.prev_action = action.copy()
@@ -342,7 +333,7 @@ class RobotEnvBullet(gym.Env):
 
         # --- termination ---
         self._fell = base_height < 0.20
-        bad_orientation = abs(roll) > 0.6 or abs(pitch) > 0.6
+        bad_orientation = abs(roll) > 0.8 or abs(pitch) > 0.8
 
         terminated = self._fell or bad_orientation
         truncated  = self._step_count >= self.max_episode_steps
@@ -383,34 +374,30 @@ class RobotEnvBullet(gym.Env):
         return np.concatenate([joint_pos, joint_vel, lin_vel, ang_vel, quat, gravity_body])
 
     # ------------------------------------------------------------------
-    def _compute_reward(self, obs: np.ndarray, torques: np.ndarray, smooth_penalty: float, base_height: float) -> float:
-        lin_vel  = obs[24:27]
-
+    def _compute_reward(self, obs, torques, smooth_penalty, base_height):
+        lin_vel = obs[24:27]
         base_pos, base_orn = p.getBasePositionAndOrientation(self._robot_id)
-        roll, pitch, _     = p.getEulerFromQuaternion(base_orn)
+        roll, pitch, _ = p.getEulerFromQuaternion(base_orn)
 
         forward_vel = float(lin_vel[self.forward_axis])
         lateral_vel = float(lin_vel[1 - self.forward_axis])
+        yaw_rate    = float(obs[29])
 
-        yaw_rate = float(obs[29])
-        forward_vel_pos = max(0.0, forward_vel)
-        r_vel = np.clip(forward_vel_pos, 0.0, 2.0) * 16.0 * self.forward_reward_scale
-        stall_penalty = -0.5 * max(0.0, 0.25 - forward_vel_pos) * self.forward_reward_scale
-        # Early-training stability bonuses: encourage upright stance and height.
-        upright_bonus = np.exp(-2.0 * (roll**2 + pitch**2))
-        height_bonus = np.clip((base_height - 0.30) / 0.20, 0.0, 1.0)
-        stability_bonus = self.stability_bonus_scale * (0.5 * upright_bonus + 0.5 * height_bonus)
+        # Stronger forward-drive reward to break stand-still local optimum.
+        r_vel = float(np.clip(forward_vel * 20.0, -6.0, 24.0))
+
+        # Scale penalties with speed so early exploration is not over-penalized.
+        speed_gate = float(np.clip(abs(forward_vel) / 0.6, 0.0, 1.0))
+        penalty_scale = 0.30 + 0.70 * speed_gate
+
         r = (
             r_vel
-            + stall_penalty
-            + stability_bonus
-            - 0.5 * abs(lateral_vel)
-            - 0.75 * (yaw_rate ** 2)
-            - 1.0 * (roll**2 + pitch**2)
-            - 1.0 * max(0.0, 0.40 - base_height)
-            - 0.01 * smooth_penalty
+            - penalty_scale * 0.20 * abs(lateral_vel)
+            - penalty_scale * 0.15 * (yaw_rate ** 2)
+            - penalty_scale * 0.25 * (roll**2 + pitch**2)
+            - penalty_scale * 0.15 * max(0.0, 0.40 - base_height)
+            - penalty_scale * 0.0015 * smooth_penalty
         )
-
         return float(r)
 
     # ------------------------------------------------------------------

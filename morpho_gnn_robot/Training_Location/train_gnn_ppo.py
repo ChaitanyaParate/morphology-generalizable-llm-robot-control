@@ -5,9 +5,10 @@ CleanRL-style PPO adapted for GNN graph observations.
 Runs on Kaggle (T4/P100 GPU, headless, PyBullet DIRECT mode).
 
 Key changes from CleanRL ppo_continuous_action.py:
-  1. obs is a list of PyG Data objects, not a flat tensor
-  2. Minibatch creation uses Batch.from_data_list()
-  3. Graph is built from obs[:24] (joint pos/vel) at each rollout step
+    1. obs is a list of PyG Data objects, not a flat tensor
+    2. Minibatch creation uses Batch.from_data_list()
+    3. Graph is built from joint pos/vel plus base orientation, gravity,
+         and base linear/angular velocity at each rollout step
 
 Usage:
   python train_gnn_ppo.py
@@ -85,18 +86,19 @@ class Config:
     seed:             int   = 0
     total_timesteps:  int   = 5_000_000
     gnn_learning_rate:    float = 3e-4
-    actor_learning_rate:  float = 1e-3
+    actor_learning_rate:  float = 5e-4
     critic_learning_rate: float = 1e-3
     num_steps:        int   = 4096    # rollout length before each update
     num_minibatches:  int   = 4
     update_epochs:    int   = 8
     gamma:            float = 0.99
     gae_lambda:       float = 0.95
-    clip_coef:        float = 0.25
-    ent_coef:         float = 0.005   # encourage exploration and avoid entropy collapse
+    clip_coef:        float = 0.20
+    ent_coef:         float = 0.001   # encourage exploration and avoid entropy collapse
     vf_coef:          float = 1.0
     max_grad_norm:    float = 0.5
     clip_vloss:       bool  = False
+    target_kl:        float = 0.03
     resume_path: str = None
 
     # GNN
@@ -107,11 +109,6 @@ class Config:
     run_name:    str  = ""
     save_every:  int  = 70_000   # checkpoint every N timesteps
     checkpoint_dir: str = "./checkpoints"
-
-    # Warmup (stability-first) reward scaling
-    warmup_steps: int = 0
-    warmup_forward_scale: float = 1.0
-    warmup_stability_scale: float = 1.0
 
     @property
     def minibatch_size(self):
@@ -211,7 +208,7 @@ def train(cfg: Config):
 
     # ---- wandb ----
     if cfg.track:
-        import wandb
+        import wandb  # type: ignore[import-not-found]
         wandb.init(project="morpho_gnn_robot", name=cfg.run_name, config=cfg.__dict__)
 
     # ---- env + builder ----
@@ -260,6 +257,7 @@ def train(cfg: Config):
     base_lrs = [pg["lr"] for pg in optimizer.param_groups]
 
     start_global_step = 0
+    episode_rewards: List[float] = []
 
     if cfg.resume_path is not None:
         print(f"\nLoading checkpoint: {cfg.resume_path}")
@@ -268,7 +266,19 @@ def train(cfg: Config):
         if "optimizer" in checkpoint:
             try:
                 optimizer.load_state_dict(checkpoint["optimizer"])
-                base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+                base_lrs = [
+                    cfg.gnn_learning_rate,
+                    cfg.actor_learning_rate,
+                    cfg.critic_learning_rate,
+                ]
+                if len(optimizer.param_groups) == len(base_lrs):
+                    for lr, pg in zip(base_lrs, optimizer.param_groups):
+                        pg["lr"] = lr
+                else:
+                    print(
+                        "Warning: optimizer param group count mismatch; "
+                        "learning rates not overridden from config."
+                    )
             except Exception as exc:
                 print(f"Warning: could not load optimizer state ({exc}). Using fresh optimizer.")
         start_global_step = checkpoint.get("global_step", 0)
@@ -294,10 +304,11 @@ def train(cfg: Config):
 
     global_step      = start_global_step
     update           = 0
-    episode_rewards: List[float] = []
     episode_lengths: List[int]   = []
+    episode_forward_vels: List[float] = []
     ep_reward        = 0.0
     ep_length        = 0
+    ep_forward_vel_sum = 0.0
 
     start_time = time.time()
 
@@ -322,31 +333,24 @@ def train(cfg: Config):
             global_step += 1
             ep_length   += 1
 
-            if cfg.warmup_steps > 0:
-                warmup_progress = min(
-                    (global_step - start_global_step) / cfg.warmup_steps,
-                    1.0,
-                )
-                forward_scale = cfg.warmup_forward_scale + warmup_progress * (
-                    1.0 - cfg.warmup_forward_scale
-                )
-                stability_scale = cfg.warmup_stability_scale + warmup_progress * (
-                    1.0 - cfg.warmup_stability_scale
-                )
-                env.set_reward_scales(
-                    forward_scale=forward_scale,
-                    stability_scale=stability_scale,
-                )
-
             # Normalize only joint states (dims 0-30); orientation dims are raw
             obs_norm.update(obs[:OBS_NORM_DIM])
             obs_n = obs_norm.normalize(obs[:OBS_NORM_DIM])
 
             joint_pos = obs_n[:12]
             joint_vel = obs_n[12:24]
+            body_lin_vel = obs_n[24:27]
+            body_ang_vel = obs_n[27:30]
             body_quat = obs[30:34].astype(np.float32)   # unit quaternion -- do not normalize
             body_grav = obs[34:37].astype(np.float32)   # unit vector -- do not normalize
-            graph     = builder.get_graph(joint_pos, joint_vel, body_quat, body_grav).to(device)
+            graph = builder.get_graph(
+                joint_pos,
+                joint_vel,
+                body_quat=body_quat,
+                body_grav=body_grav,
+                body_lin_vel=body_lin_vel,
+                body_ang_vel=body_ang_vel,
+            ).to(device)
 
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(graph)
@@ -356,6 +360,7 @@ def train(cfg: Config):
             obs, reward, terminated, truncated, info = env.step(action_np)
             done    = terminated or truncated
             ep_reward += reward
+            ep_forward_vel_sum += float(obs[24 + env.forward_axis])
 
             # store raw (unscaled) reward -- critic learns actual return scale
             buffer.store(graph.to("cpu"), action.cpu(), logprob.cpu(),
@@ -364,8 +369,10 @@ def train(cfg: Config):
             if done:
                 episode_rewards.append(ep_reward)
                 episode_lengths.append(ep_length)
+                episode_forward_vels.append(ep_forward_vel_sum / max(ep_length, 1))
                 ep_reward  = 0.0
                 ep_length  = 0
+                ep_forward_vel_sum = 0.0
                 obs, _     = env.reset()
 
         # next value for GAE bootstrap
@@ -374,9 +381,18 @@ def train(cfg: Config):
             obs_n       = obs_norm.normalize(obs[:OBS_NORM_DIM])
             joint_pos   = obs_n[:12]
             joint_vel   = obs_n[12:24]
+            body_lin_vel = obs_n[24:27]
+            body_ang_vel = obs_n[27:30]
             body_quat   = obs[30:34].astype(np.float32)
             body_grav   = obs[34:37].astype(np.float32)
-            next_graph  = builder.get_graph(joint_pos, joint_vel, body_quat, body_grav).to(device)
+            next_graph = builder.get_graph(
+                joint_pos,
+                joint_vel,
+                body_quat=body_quat,
+                body_grav=body_grav,
+                body_lin_vel=body_lin_vel,
+                body_ang_vel=body_ang_vel,
+            ).to(device)
             next_value  = agent.get_value(next_graph)
 
         advantages, returns = buffer.compute_advantages(
@@ -396,6 +412,7 @@ def train(cfg: Config):
 
         for epoch in range(cfg.update_epochs):
             np.random.shuffle(indices)
+            early_stop = False
 
             for start in range(0, cfg.num_steps, cfg.minibatch_size):
                 mb_idx = indices[start : start + cfg.minibatch_size]
@@ -421,6 +438,10 @@ def train(cfg: Config):
                         ((ratio - 1.0).abs() > cfg.clip_coef).float().mean().item()
                     )
                     approx_kls.append(((ratio - 1.0) - logratio).mean().item())
+
+                if cfg.target_kl and np.mean(approx_kls) > cfg.target_kl:
+                    early_stop = True
+                    break
 
                 # policy loss
                 pg_loss1 = -mb_adv * ratio
@@ -452,6 +473,9 @@ def train(cfg: Config):
                 vf_losses.append(vf_loss.item())
                 ent_losses.append(ent_loss.item())
 
+            if early_stop:
+                break
+
         # Critic fit quality: how much return variance is explained by value preds.
         # 1.0 is perfect, ~0 means little predictive power, <0 is very poor.
         y_pred = buffer.values.cpu().numpy()
@@ -469,14 +493,17 @@ def train(cfg: Config):
         if episode_rewards:
             mean_ep_rew = np.mean(episode_rewards[-20:])
             mean_ep_len = np.mean(episode_lengths[-20:])
+            mean_ep_fwd = np.mean(episode_forward_vels[-20:])
         else:
             mean_ep_rew = 0.0
             mean_ep_len = 0.0
+            mean_ep_fwd = 0.0
 
         print(
             f"step={global_step:>8d} | "
             f"ep_rew={mean_ep_rew:>8.2f} | "
             f"ep_len={mean_ep_len:>6.0f} | "
+            f"ep_fwd={mean_ep_fwd:>6.3f} | "
             f"pg={np.mean(pg_losses):>7.4f} | "
             f"vf={np.mean(vf_losses):>7.4f} | "
             f"ent={np.mean(ent_losses):>6.4f} | "
@@ -490,10 +517,11 @@ def train(cfg: Config):
         )
 
         if cfg.track:
-            import wandb
+            import wandb  # type: ignore[import-not-found]
             wandb.log({
                 "charts/ep_reward_mean":   mean_ep_rew,
                 "charts/ep_length_mean":   mean_ep_len,
+                "charts/ep_forward_vel_mean": mean_ep_fwd,
                 "losses/policy_loss":      np.mean(pg_losses),
                 "losses/value_loss":       np.mean(vf_losses),
                 "losses/entropy":          np.mean(ent_losses),
@@ -527,7 +555,7 @@ def train(cfg: Config):
 
     env.close()
     if cfg.track:
-        import wandb
+        import wandb  # type: ignore[import-not-found]
         wandb.finish()
 
 
