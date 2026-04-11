@@ -24,6 +24,7 @@ setup(
             "llm_planner_node       = morpho_robot.llm_planner_node:main",
             "skill_translator_node  = morpho_robot.skill_translator_node:main",
             "gnn_policy_node        = morpho_robot.gnn_policy_node:main",
+            "MLP_policy_node        = morpho_robot.MLP_policy_node:main",
         ],
     },
 )

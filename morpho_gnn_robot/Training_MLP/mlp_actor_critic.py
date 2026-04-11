@@ -32,7 +32,7 @@ class MLPActorCritic(nn.Module):
             nn.Tanh(),
             _layer_init(nn.Linear(hidden_dim, action_dim), std=0.01),
         )
-        self.log_std = nn.Parameter(torch.full((action_dim,), -0.7))
+        self.log_std = nn.Parameter(torch.full((action_dim,), -0.3))
 
         self.critic_head = nn.Sequential(
             _layer_init(nn.Linear(hidden_dim, hidden_dim), std=0.5),
@@ -51,7 +51,7 @@ class MLPActorCritic(nn.Module):
         h = self._encode(obs)
         mean = self.actor_head(h)
 
-        std = self.log_std.exp().clamp(min=0.15, max=0.8)
+        std = self.log_std.exp().clamp(min=0.05, max=0.6)
         std = std.unsqueeze(0).expand_as(mean)
         dist = Normal(mean, std)
 

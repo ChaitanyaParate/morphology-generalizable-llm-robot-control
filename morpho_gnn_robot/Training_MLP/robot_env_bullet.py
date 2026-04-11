@@ -64,11 +64,9 @@ class RobotEnvBullet(gym.Env):
     metadata = {"render_modes": ["human", "direct"]}
 
     # Reward weights
-    # NOTE: torque cost removed -- with KP=150 torques reach 75 Nm per joint,
-    # making τ² sum ~67,500 per step. At 1e-4 that is -6.75 per step, -6750
-    # over 1000 steps. The agent learns to do nothing to minimize torque cost
-    # rather than walk. Remove it until locomotion emerges; add back later.
-    FALL_PENALTY = 150.0
+    # NOTE: torque cost is small but non-zero to regularize energy without
+    # collapsing to a stand-still policy.
+    FALL_PENALTY = 80.0
 
     def __init__(
         self,
@@ -282,14 +280,15 @@ class RobotEnvBullet(gym.Env):
         # forces per joint, immediately destabilising the body before the
         # policy has any chance to learn. At 0.1 rad: max unintended force
         # is 5.5Nm -- robot stays near nominal during random exploration.
-        # action_scale = 0.35 rad: sufficient range for trot gait on ANYmal.
+        # action_scale = 0.80 rad: push exploration toward larger strides.
         # HFE joint needs ~0.3-0.4 rad swing range for a proper step.
         # Previously 0.1 rad was needed because policy had no orientation obs
         # and random large actions caused immediate falls.
         # Now orientation (gravity vector) is in obs so the policy can
         # stabilize while learning to walk. 0.35 gives locomotion range
         # without producing joint limit violations.
-        target_pos = self._nominal_pos + action * 0.45
+        action_scale = 0.80
+        target_pos = self._nominal_pos + action * action_scale
 
         smooth_penalty = np.sum((action - self.prev_action) ** 2)
         self.prev_action = action.copy()
@@ -383,20 +382,33 @@ class RobotEnvBullet(gym.Env):
         lateral_vel = float(lin_vel[1 - self.forward_axis])
         yaw_rate    = float(obs[29])
 
-        # Stronger forward-drive reward to break stand-still local optimum.
-        r_vel = float(np.clip(forward_vel * 20.0, -6.0, 24.0))
+        # Stronger forward-drive reward with a quadratic boost for speed.
+        fwd_pos = max(forward_vel, 0.0)
+        r_vel = float(
+            np.clip(120.0 * forward_vel + 120.0 * (fwd_pos ** 2) + 30.0 * abs(forward_vel), -10.0, 180.0)
+        )
 
         # Scale penalties with speed so early exploration is not over-penalized.
         speed_gate = float(np.clip(abs(forward_vel) / 0.6, 0.0, 1.0))
-        penalty_scale = 0.30 + 0.70 * speed_gate
+        penalty_scale = 0.10 + 0.90 * speed_gate
+
+        upright_bonus = 0.05 * np.exp(-2.0 * (roll**2 + pitch**2))
+        height_bonus = 0.0
+        speed_bonus = 60.0 * max(0.0, forward_vel - 0.03)
+
+        torque_pen = 0.0005 * (0.02 + 0.98 * speed_gate) * float(np.sum(torques ** 2))
 
         r = (
             r_vel
             - penalty_scale * 0.20 * abs(lateral_vel)
             - penalty_scale * 0.15 * (yaw_rate ** 2)
-            - penalty_scale * 0.25 * (roll**2 + pitch**2)
-            - penalty_scale * 0.15 * max(0.0, 0.40 - base_height)
-            - penalty_scale * 0.0015 * smooth_penalty
+            - penalty_scale * 0.20 * (roll**2 + pitch**2)
+            - penalty_scale * 0.15 * max(0.0, 0.50 - base_height)
+            - penalty_scale * 0.0005 * smooth_penalty
+            - torque_pen
+            + upright_bonus
+            + height_bonus
+            + speed_bonus
         )
         return float(r)
 

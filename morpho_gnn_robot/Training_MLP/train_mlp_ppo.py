@@ -61,19 +61,20 @@ class Config:
     total_timesteps: int = 5_000_000
     mlp_learning_rate: float = 3e-4
     actor_learning_rate: float = 5e-4
-    critic_learning_rate: float = 1e-3
+    critic_learning_rate: float = 5e-4
     num_steps: int = 4096
     num_minibatches: int = 4
-    update_epochs: int = 8
+    update_epochs: int = 6
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_coef: float = 0.20
-    ent_coef: float = 0.001
-    vf_coef: float = 1.0
+    clip_coef: float = 0.15
+    ent_coef: float = 0.0
+    vf_coef: float = 0.5
     max_grad_norm: float = 0.5
-    clip_vloss: bool = False
-    target_kl: float = 0.03
+    clip_vloss: bool = True
+    target_kl: float = 0.02
     resume_path: str = None
+    resume_optimizer: bool = True
 
     hidden_dim: int = 256
 
@@ -212,7 +213,7 @@ def train(cfg: Config):
         print(f"\nLoading checkpoint: {cfg.resume_path}")
         checkpoint = torch.load(cfg.resume_path, map_location=device, weights_only=False)
         agent.load_state_dict(checkpoint["agent"])
-        if "optimizer" in checkpoint:
+        if cfg.resume_optimizer and "optimizer" in checkpoint:
             try:
                 optimizer.load_state_dict(checkpoint["optimizer"])
                 base_lrs = [
@@ -225,6 +226,8 @@ def train(cfg: Config):
                         pg["lr"] = lr
             except Exception as exc:
                 print(f"Warning: could not load optimizer state ({exc}). Using fresh optimizer.")
+        elif not cfg.resume_optimizer:
+            print("Resume: skipping optimizer state per resume_optimizer=0")
         start_global_step = checkpoint.get("global_step", 0)
         episode_rewards = checkpoint.get("episode_rewards", [])
         if "obs_norm_mean" in checkpoint:

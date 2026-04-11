@@ -383,12 +383,13 @@ class RobotEnvBullet(gym.Env):
         lateral_vel = float(lin_vel[1 - self.forward_axis])
         yaw_rate    = float(obs[29])
 
-        # Stronger forward-drive reward to break stand-still local optimum.
-        r_vel = float(np.clip(forward_vel * 20.0, -6.0, 24.0))
+        # Stronger forward-drive reward with quadratic boost for faster gaits.
+        fwd_pos = max(forward_vel, 0.0)
+        r_vel = float(np.clip(60.0 * forward_vel + 30.0 * (fwd_pos ** 2), -8.0, 32.0))
 
         # Scale penalties with speed so early exploration is not over-penalized.
         speed_gate = float(np.clip(abs(forward_vel) / 0.6, 0.0, 1.0))
-        penalty_scale = 0.30 + 0.70 * speed_gate
+        penalty_scale = 0.20 + 0.50 * speed_gate
 
         r = (
             r_vel
@@ -396,7 +397,7 @@ class RobotEnvBullet(gym.Env):
             - penalty_scale * 0.15 * (yaw_rate ** 2)
             - penalty_scale * 0.25 * (roll**2 + pitch**2)
             - penalty_scale * 0.15 * max(0.0, 0.40 - base_height)
-            - penalty_scale * 0.0015 * smooth_penalty
+            - penalty_scale * 0.0012 * smooth_penalty
         )
         return float(r)
 

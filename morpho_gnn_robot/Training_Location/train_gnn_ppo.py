@@ -94,7 +94,7 @@ class Config:
     gamma:            float = 0.99
     gae_lambda:       float = 0.95
     clip_coef:        float = 0.20
-    ent_coef:         float = 0.001   # encourage exploration and avoid entropy collapse
+    ent_coef:         float = 0.0002  # lower entropy for steadier gait
     vf_coef:          float = 1.0
     max_grad_norm:    float = 0.5
     clip_vloss:       bool  = False
@@ -102,7 +102,7 @@ class Config:
     resume_path: str = None
 
     # GNN
-    hidden_dim:  int = 64
+    hidden_dim:  int = 48
 
     # Logging
     track:       bool = False    # set True on Kaggle with wandb key

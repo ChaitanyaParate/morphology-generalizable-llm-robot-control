@@ -793,6 +793,14 @@
             name="gz::sim::systems::JointStatePublisher">
         </plugin>
 
+        <plugin filename="gz-sim-odometry-publisher-system"
+            name="gz::sim::systems::OdometryPublisher">
+        <odom_frame>odom</odom_frame>
+        <robot_base_frame>base</robot_base_frame>
+        <odom_topic>/model/robot/odometry</odom_topic>
+        <publish_tf>true</publish_tf>
+        </plugin>
+
         <plugin filename="gz-sim-joint-position-controller-system"
                 name="gz::sim::systems::JointPositionController">
         <joint_name>LF_HAA</joint_name>

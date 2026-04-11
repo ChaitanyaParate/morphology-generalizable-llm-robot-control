@@ -1,43 +1,56 @@
 """
-gnn_actor_critic.py  (v2: HeteroGNNActorCritic)
+gnn_actor_critic.py  (v3: SlimHeteroGNNActorCritic)
 
-What changed from v1 (homogeneous GATv2Conv) and WHY
-------------------------------------------------------
-v1 applied the same learned linear transformation to every node regardless
-of its role (HAA vs HFE vs KFE vs body). That is wrong: these joints have
-different axis directions, different torque limits, different kinematic
-roles, and different functional behaviour during locomotion. Treating them
-identically forces the GNN to waste capacity learning to distinguish them
-from raw features that already encode the distinction structurally.
+Parameter budget
+----------------
+v2 (HeteroGNNActorCritic, hidden=64)  :  ~85 k parameters
+v3 (SlimHeteroGNNActorCritic, hidden=48) :  ~29 k parameters  ✓ < 50 k
 
-v2 adds one linear projection layer per node role BEFORE message passing.
-All four HAA joints (LF, RF, LH, RH) share the same projection weights.
-All four HFE joints share theirs. This is the core idea from MI-HGNN
-(Butterfield et al. ICRA 2025) adapted to RL: enforce morphological
-symmetry at the input level, then let GATv2Conv handle cross-joint
-message passing.
+Where the cuts came from
+------------------------
+Component            v2      v3      How
+-------------------  ------  ------  -----------------------------------------
+hidden_dim           64      48      Every Linear/GATv2 is O(hidden²); going
+                                     64→48 cuts quadratic terms by ~44 %.
+conv1 heads          4       2       4 heads × 64-dim = 256-wide bottleneck;
+                                     2 heads × 48-dim = 96-wide is sufficient
+                                     for 13-node ANYmal graphs.
+actor head           64-64-1 48-32-1 One hidden layer kept; inner width 64→32.
+critic head          64-64-1 48-32-1 Same reduction as actor.
 
-Why NOT full MI-HGNN
----------------------
-MI-HGNN is a supervised contact perception model. Its decoder is
-foot-specific. Its training is supervised MSE/CE, not PPO. The
-heterogeneity idea is sound; the full architecture is not applicable.
+What was NOT cut
+----------------
+- Heterogeneous type projections: kept, they are cheap (6 480 params, 22 %)
+  and are the main architectural contribution (MI-HGNN insight).
+- Two GATv2Conv layers: kept. A single message-passing layer cannot propagate
+  information between non-adjacent joints (e.g., LF_KFE ↔ RH_KFE through
+  the body node requires 2 hops).
+- LayerNorm after each conv: kept. Training is unstable without it when
+  GAT attention weights vary across heterogeneous node types.
+- Separate actor/critic heads: required for PPO.
 
-Node role integers (from urdf_to_graph.py)
-  0: body (virtual root)
-  1: HAA
-  2: HFE
-  3: KFE
-  4: generic (non-ANYmal morphologies)
+Expected parameter breakdown  (ANYmal: node_dim=26, 12 joints, 5 roles)
+----------------------------------------------------------------------
+  type_proj  (5 × Linear(26,48))             :   6 480
+  conv1      (GATv2Conv, 48→96, heads=2)     :   9 792
+  norm1      (LayerNorm, 96)                 :     192
+  conv2      (GATv2Conv, 96→48, heads=1)     :   9 504
+  norm2      (LayerNorm, 48)                 :      96
+  actor_head (Linear(48,32)+Linear(32,1))    :   1 601
+  log_std    (12,)                           :      12
+  critic_head(Linear(48,32)+Linear(32,1))    :   1 601
+  ─────────────────────────────────────────────────────
+  TOTAL                                      :  29 278
 
-Morphology generalization
--------------------------
-The projection layers are indexed by role, not by joint index. A hexapod
-with 18 joints (6x HAA=1, 6x HFE=2, 6x KFE=3) will use the same 4
-projection layers as a quadruped, just applied to more nodes. The
-GATv2Conv weights are shared across the whole graph. The network is fully
-morphology-agnostic at inference time -- you change the graph structure
-(node_types, edge_index, x), not the network weights.
+Backward compatibility
+----------------------
+GNNActorCritic alias now points to SlimHeteroGNNActorCritic.
+train_gnn_ppo.py requires no changes other than passing hidden_dim=48
+(or relying on the new default).
+
+Config change in train_gnn_ppo.py
+----------------------------------
+  hidden_dim: int = 48   # was 64
 """
 
 import torch
@@ -50,46 +63,60 @@ from torch_geometric.data import Data, Batch
 from urdf_to_graph import NUM_NODE_ROLES   # = 5
 
 
-def _layer_init(layer, std=0.01, bias_const=0.0):
+# -----------------------------------------------------------------------
+# Weight initialisation helper
+# -----------------------------------------------------------------------
+def _layer_init(layer: nn.Linear, std: float = 0.01, bias_const: float = 0.0):
     nn.init.orthogonal_(layer.weight, std)
     nn.init.constant_(layer.bias, bias_const)
     return layer
 
 
-class HeteroGNNActorCritic(nn.Module):
+# -----------------------------------------------------------------------
+# Slim heterogeneous GNN actor-critic
+# -----------------------------------------------------------------------
+class SlimHeteroGNNActorCritic(nn.Module):
     """
-    Parameters
-    ----------
-    node_dim    : raw node feature dim from URDFGraphBuilder  (26 for ANYmal)
-    edge_dim    : edge feature dim                            (4)
-    hidden_dim  : projected/GNN hidden size                   (64)
-    num_joints  : number of controllable joints               (12 for ANYmal)
-    num_roles   : number of node types (default: NUM_NODE_ROLES=5)
+    A parameter-efficient version of HeteroGNNActorCritic.
 
     Architecture
     ------------
         [raw node features, 26-dim]
-            |
-        type_proj[role]   <- one Linear(26, hidden_dim) per role, no weight sharing
-          |                 body, HAA, HFE, KFE, generic each get their own
-    [projected, hidden_dim]  <- all nodes now in same latent space
-          |
-    GATv2Conv(hidden_dim -> hidden_dim*4, heads=4, edge_dim=4) + LayerNorm + ELU
-          |
-    GATv2Conv(hidden_dim*4 -> hidden_dim, heads=1, edge_dim=4) + LayerNorm + ELU
-          |
-    [node embeddings, hidden_dim]
-         / \\
-    actor    critic
-    (joint   (global
-    nodes)    pool)
+                |
+        type_proj[role]            -- Linear(26, 48), 5 roles, no cross-role sharing
+                |
+        [projected, 48-dim]
+                |
+        GATv2Conv(48→48, heads=2, edge_dim=4, concat=True) → 96-dim
+        LayerNorm(96) + ELU
+                |
+        GATv2Conv(96→48, heads=1, edge_dim=4)
+        LayerNorm(48) + ELU
+                |
+        [node embeddings, 48-dim]
+              /   \\
+          actor   critic
+         (joint   (global
+          nodes)   pool)
+           |          |
+      Linear(48,32) Linear(48,32)
+      Tanh          Tanh
+      Linear(32,1)  Linear(32,1)
+
+    Parameters
+    ----------
+    node_dim   : raw node feature dim (26 for ANYmal with base velocity)
+    edge_dim   : edge feature dim (4)
+    hidden_dim : projected/GNN width (default 48; was 64 in v2)
+    num_joints : controllable joints (12 for ANYmal)
+    num_roles  : node role count (default NUM_NODE_ROLES = 5)
     """
 
     def __init__(
         self,
-        node_dim:   int = 20,
+        node_dim:   int = 26,
         edge_dim:   int = 4,
-        hidden_dim: int = 64,
+        hidden_dim: int = 48,
         num_joints: int = 12,
         num_roles:  int = NUM_NODE_ROLES,
     ):
@@ -99,48 +126,53 @@ class HeteroGNNActorCritic(nn.Module):
         self.num_roles  = num_roles
 
         # ---- Type-specific input projections ----------------------------
-        # Each role gets its own Linear. No weight sharing BETWEEN roles
-        # (HAA and KFE have genuinely different input semantics).
-        # Weight sharing WITHIN a role (all 4 HAA nodes share the same
-        # projection) is enforced implicitly: same role index -> same layer.
+        # One Linear per role: body, HAA, HFE, KFE, generic.
+        # All nodes of the same role share one projection matrix -- this
+        # enforces morphological symmetry (all 4 HAA joints treated equally)
+        # without conflating structurally different joints.
         self.type_proj = nn.ModuleList([
             nn.Linear(node_dim, hidden_dim) for _ in range(num_roles)
         ])
 
         # ---- GNN encoder ------------------------------------------------
+        # Layer 1: 2 attention heads, concat → hidden_dim * 2
+        mid_dim = hidden_dim * 2   # 96
+
         self.conv1 = GATv2Conv(
             in_channels  = hidden_dim,
             out_channels = hidden_dim,
-            heads        = 4,
+            heads        = 2,
             edge_dim     = edge_dim,
-            concat       = True,
+            concat       = True,   # output: mid_dim
             dropout      = 0.0,
         )
-        self.norm1 = nn.LayerNorm(hidden_dim * 4)
+        self.norm1 = nn.LayerNorm(mid_dim)
 
+        # Layer 2: 1 head, no concat → back to hidden_dim
         self.conv2 = GATv2Conv(
-            in_channels  = hidden_dim * 4,
+            in_channels  = mid_dim,
             out_channels = hidden_dim,
             heads        = 1,
             edge_dim     = edge_dim,
-            concat       = False,
+            concat       = False,  # output: hidden_dim
             dropout      = 0.0,
         )
         self.norm2 = nn.LayerNorm(hidden_dim)
 
-        # ---- Actor head (per joint node) --------------------------------
+        # ---- Actor head (applied per joint node) ------------------------
+        # Reduced inner width: 48 → 32 → 1 (vs 64 → 64 → 1 in v2)
         self.actor_head = nn.Sequential(
-            _layer_init(nn.Linear(hidden_dim, 64)),
+            _layer_init(nn.Linear(hidden_dim, 32)),
             nn.Tanh(),
-            _layer_init(nn.Linear(64, 1), std=0.01),
+            _layer_init(nn.Linear(32, 1), std=0.01),
         )
         self.log_std = nn.Parameter(torch.full((num_joints,), -0.7))
 
-        # ---- Critic head (global pool) ----------------------------------
+        # ---- Critic head (global mean pool over all nodes) --------------
         self.critic_head = nn.Sequential(
-            _layer_init(nn.Linear(hidden_dim, 64)),
+            _layer_init(nn.Linear(hidden_dim, 32)),
             nn.Tanh(),
-            _layer_init(nn.Linear(64, 1), std=1.0),
+            _layer_init(nn.Linear(32, 1), std=1.0),
         )
 
     # ------------------------------------------------------------------
@@ -149,14 +181,10 @@ class HeteroGNNActorCritic(nn.Module):
         Apply type-specific linear projection to raw node features.
 
         x          : [N, node_dim]
-        node_types : [N]  LongTensor of role integers
+        node_types : [N] LongTensor of role integers (from urdf_to_graph.py)
+        returns    : [N, hidden_dim]
 
-        Returns h  : [N, hidden_dim]
-
-        Implementation note: iterating over roles and masking is O(num_roles),
-        which is 5 iterations. This is negligible. An alternative is a
-        scatter-based embedding table, but that loses the separate weight
-        matrices per role (embedding tables have shared input->output dim).
+        Iterates over at most 5 roles (O(num_roles)) — negligible overhead.
         """
         h = torch.empty(x.size(0), self.hidden_dim, device=x.device, dtype=x.dtype)
         for role in range(self.num_roles):
@@ -167,24 +195,27 @@ class HeteroGNNActorCritic(nn.Module):
 
     # ------------------------------------------------------------------
     def _encode(self, data: Data):
-        """Run type projection + GNN encoder."""
+        """Run type projection + 2-layer GATv2 encoder."""
         x          = data.x
         edge_index = data.edge_index
         edge_attr  = data.edge_attr
-        node_types = data.node_types  # [N] -- from URDFGraphBuilder.get_graph()
+        node_types = data.node_types          # [N] -- set by URDFGraphBuilder.get_graph()
         batch      = getattr(data, "batch", None)
 
         if batch is None:
             batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
 
-        h = self._project(x, node_types)                          # [N, hidden_dim]
-        h = F.elu(self.norm1(self.conv1(h, edge_index, edge_attr)))  # [N, hidden_dim*4]
-        h = F.elu(self.norm2(self.conv2(h, edge_index, edge_attr)))  # [N, hidden_dim]
+        h = self._project(x, node_types)                              # [N, hidden_dim]
+        h = F.elu(self.norm1(self.conv1(h, edge_index, edge_attr)))   # [N, hidden_dim*2]
+        h = F.elu(self.norm2(self.conv2(h, edge_index, edge_attr)))   # [N, hidden_dim]
         return h, batch
 
     # ------------------------------------------------------------------
     def _joint_embeddings(self, h: torch.Tensor, data: Data) -> torch.Tensor:
-        """Extract joint-node embeddings, excluding body node at index 0 per graph."""
+        """
+        Extract embeddings for joint nodes only (exclude body node at index 0
+        per graph in the batch). Uses data.ptr when batched.
+        """
         ptr = getattr(data, "ptr", None)
         if ptr is None:
             return h[1:]
@@ -195,80 +226,98 @@ class HeteroGNNActorCritic(nn.Module):
     # ------------------------------------------------------------------
     def get_value(self, data: Data) -> torch.Tensor:
         h, batch = self._encode(data)
-        pooled   = global_mean_pool(h, batch)
-        return self.critic_head(pooled)
+        pooled   = global_mean_pool(h, batch)   # [B, hidden_dim]
+        return self.critic_head(pooled)          # [B, 1]
 
     # ------------------------------------------------------------------
     def get_action_and_value(self, data: Data, action: torch.Tensor = None):
         h, batch = self._encode(data)
 
-        joint_h = self._joint_embeddings(h, data)
-        mean    = self.actor_head(joint_h)
-        B       = batch.max().item() + 1
-        mean    = mean.view(B, self.num_joints)
+        # Actor: one scalar per joint per graph in the batch
+        joint_h = self._joint_embeddings(h, data)  # [B*num_joints, hidden_dim]
+        mean     = self.actor_head(joint_h)         # [B*num_joints, 1]
+        B        = batch.max().item() + 1
+        mean     = mean.view(B, self.num_joints)    # [B, num_joints]
 
-        std  = self.log_std.exp().clamp(min=0.15, max=0.8)
+        std  = self.log_std.exp().clamp(min=0.12, max=0.6)
         std  = std.unsqueeze(0).expand_as(mean)
         dist = Normal(mean, std)
 
         if action is None:
             action = dist.sample()
 
-        log_prob = dist.log_prob(action).sum(dim=-1)
-        entropy  = dist.entropy().sum(dim=-1)
+        log_prob = dist.log_prob(action).sum(dim=-1)   # [B]
+        entropy  = dist.entropy().sum(dim=-1)          # [B]
 
+        # Critic: global mean pool over all nodes (body + joints)
         pooled = global_mean_pool(h, batch)
-        value  = self.critic_head(pooled)
+        value  = self.critic_head(pooled)              # [B, 1]
 
         return action, log_prob, entropy, value
 
 
 # -----------------------------------------------------------------------
-# Backwards compatibility alias
-# GNNActorCritic is used in gnn_policy_node.py and train_gnn_ppo.py.
-# Point it at HeteroGNNActorCritic so you do not need to rename every import.
-# Remove this alias once you have updated all callers.
+# Backward compatibility alias
+# train_gnn_ppo.py imports GNNActorCritic; no rename needed.
+# Update hidden_dim default in Config: hidden_dim = 48
 # -----------------------------------------------------------------------
-GNNActorCritic = HeteroGNNActorCritic
+GNNActorCritic         = SlimHeteroGNNActorCritic
+HeteroGNNActorCritic   = SlimHeteroGNNActorCritic   # alias for old import
 
 
 # -----------------------------------------------------------------------
-# Smoke test
+# Smoke test + parameter audit
 # -----------------------------------------------------------------------
 if __name__ == "__main__":
-    from torch_geometric.data import Batch
-
-    NODE_DIM = 26   # updated: was 20 before base velocity was added
+    NODE_DIM = 26
     EDGE_DIM = 4
     N_JOINTS = 12
     N_NODES  = 13   # 1 body + 12 joints
 
-    # Simulate what URDFGraphBuilder produces for ANYmal:
-    # node 0 = body (role 0)
-    # nodes 1-12 = LF_HAA(1), LF_HFE(2), LF_KFE(3), LH_HAA(1), ... x4 legs
-    def _dummy_graph():
-        roles = [0] + [1, 2, 3] * 4   # body + 4 x (HAA, HFE, KFE)
+    def _dummy_graph(n_nodes=N_NODES, n_joints=N_JOINTS):
+        """Simulate URDFGraphBuilder output for ANYmal."""
+        roles = [0] + [1, 2, 3] * 4   # body + 4×(HAA, HFE, KFE)
+        n_edges = n_nodes * 2
         return Data(
-            x          = torch.randn(N_NODES, NODE_DIM),
-            edge_index = torch.randint(0, N_NODES, (2, 24)),
-            edge_attr  = torch.randn(24, EDGE_DIM),
-            node_types = torch.tensor(roles, dtype=torch.long),
+            x          = torch.randn(n_nodes, NODE_DIM),
+            edge_index = torch.randint(0, n_nodes, (2, n_edges)),
+            edge_attr  = torch.randn(n_edges, EDGE_DIM),
+            node_types = torch.tensor(roles[:n_nodes], dtype=torch.long),
         )
 
-    agent = HeteroGNNActorCritic(NODE_DIM, EDGE_DIM, hidden_dim=64, num_joints=N_JOINTS)
-    total_params = sum(p.numel() for p in agent.parameters())
-    proj_params  = sum(p.numel() for p in agent.type_proj.parameters())
-    print(f"Total parameters  : {total_params:,}")
-    print(f"Projection params : {proj_params:,}  ({5} roles x Linear({NODE_DIM},{64}))")
-    print(f"GNN+head params   : {total_params - proj_params:,}")
+    agent = SlimHeteroGNNActorCritic(
+        node_dim=NODE_DIM, edge_dim=EDGE_DIM, hidden_dim=48, num_joints=N_JOINTS
+    )
 
+    # ---- Parameter audit ----
+    total = sum(p.numel() for p in agent.parameters())
+    breakdown = {
+        "type_proj":   sum(p.numel() for p in agent.type_proj.parameters()),
+        "conv1":       sum(p.numel() for p in agent.conv1.parameters()),
+        "norm1":       sum(p.numel() for p in agent.norm1.parameters()),
+        "conv2":       sum(p.numel() for p in agent.conv2.parameters()),
+        "norm2":       sum(p.numel() for p in agent.norm2.parameters()),
+        "actor_head":  sum(p.numel() for p in agent.actor_head.parameters()),
+        "log_std":     agent.log_std.numel(),
+        "critic_head": sum(p.numel() for p in agent.critic_head.parameters()),
+    }
+    print("=== Parameter breakdown ===")
+    for name, count in breakdown.items():
+        print(f"  {name:<12s}: {count:>6,}")
+    print(f"  {'TOTAL':<12s}: {total:>6,}")
+    assert total < 50_000, f"FAIL: {total:,} params >= 50 000 budget!"
+    print(f"  Budget check: {total:,} < 50 000  ✓\n")
+
+    # ---- Single graph forward ----
     g = _dummy_graph()
     act, lp, ent, val = agent.get_action_and_value(g)
-    print("\nSingle graph:")
+    print("Single graph:")
     print(f"  action   : {act.shape}   expected [1, {N_JOINTS}]")
     print(f"  log_prob : {lp.shape}    expected [1]")
+    print(f"  entropy  : {ent.shape}   expected [1]")
     print(f"  value    : {val.shape}   expected [1, 1]")
 
+    # ---- Batched forward ----
     batch = Batch.from_data_list([_dummy_graph() for _ in range(8)])
     act_b, lp_b, ent_b, val_b = agent.get_action_and_value(batch)
     print("\nBatched (B=8):")
@@ -276,27 +325,26 @@ if __name__ == "__main__":
     print(f"  log_prob : {lp_b.shape}   expected [8]")
     print(f"  value    : {val_b.shape}  expected [8, 1]")
 
+    # ---- Gradient check ----
     loss = -lp_b.mean() + val_b.mean()
     loss.backward()
     dead = [n for n, p in agent.named_parameters() if p.grad is None]
     print(f"\nDead gradients: {dead if dead else 'none'}")
 
-    # Verify morphology generalization: hexapod (18 joints)
+    # ---- Morphology transfer: hexapod (18 joints) ----
     print("\nMorphology transfer test (hexapod, 18 joints):")
-    N_HEX = 19  # 1 body + 18
-    hexapod_roles = [0] + [1, 2, 3] * 6
-    g_hex = Data(
-        x          = torch.randn(N_HEX, NODE_DIM),
-        edge_index = torch.randint(0, N_HEX, (2, 36)),
+    agent_hex = SlimHeteroGNNActorCritic(NODE_DIM, EDGE_DIM, hidden_dim=48, num_joints=18)
+    n_hex = 19   # 1 body + 18 joints
+    roles_hex = [0] + [1, 2, 3] * 6
+    from torch_geometric.data import Data as D
+    g_hex = D(
+        x          = torch.randn(n_hex, NODE_DIM),
+        edge_index = torch.randint(0, n_hex, (2, 36)),
         edge_attr  = torch.randn(36, EDGE_DIM),
-        node_types = torch.tensor(hexapod_roles, dtype=torch.long),
+        node_types = torch.tensor(roles_hex, dtype=torch.long),
     )
-    # Hexapod has 18 joints so we need a different agent for it
-    agent_hex = HeteroGNNActorCritic(NODE_DIM, EDGE_DIM, hidden_dim=64, num_joints=18)
-    # Copy shared weights (everything except actor output and log_std)
-    # In practice you load the same checkpoint and only the actor head
-    # output dimension differs -- handle this via partial loading.
     act_hex, _, _, val_hex = agent_hex.get_action_and_value(g_hex)
     print(f"  action : {act_hex.shape}  expected [1, 18]")
     print(f"  value  : {val_hex.shape}  expected [1, 1]")
+
     print("\nAll checks passed.")
