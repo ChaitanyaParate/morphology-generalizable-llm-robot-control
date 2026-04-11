@@ -351,26 +351,32 @@ class RobotEnvBullet(gym.Env):
 
     # ------------------------------------------------------------------
     def _get_obs(self) -> np.ndarray:
-        """Build 37-dim observation including orientation."""
+        """Build 37-dim observation including orientation.
+
+        Velocities are rotated into the BODY frame so the policy learns
+        heading-invariant locomotion.  obs[24] always means 'forward
+        relative to the robot', regardless of world yaw.
+        """
         states    = p.getJointStates(self._robot_id, self._pybullet_indices.tolist())
         joint_pos = np.array([s[0] for s in states], dtype=np.float32)
         joint_vel = np.array([s[1] for s in states], dtype=np.float32)
 
         lin_vel, ang_vel = p.getBaseVelocity(self._robot_id)
-        lin_vel = np.array(lin_vel, dtype=np.float32)
-        ang_vel = np.array(ang_vel, dtype=np.float32)
+        lin_vel = np.array(lin_vel, dtype=np.float32)   # world frame
+        ang_vel = np.array(ang_vel, dtype=np.float32)   # world frame
 
         _, base_orn = p.getBasePositionAndOrientation(self._robot_id)
         quat = np.array(base_orn, dtype=np.float32)   # (qx, qy, qz, qw)
 
-        # Projected gravity in body frame: tells the policy which way is "down"
-        # relative to its own orientation. This is the clearest standing signal.
-        # gravity_world = [0, 0, -1] (normalized)
-        # rot_matrix maps world->body, so gravity_body = R^T * [0,0,-1]
+        # Rotation matrix: world -> body  (R^T maps world vectors to body frame)
         rot_mat = np.array(p.getMatrixFromQuaternion(base_orn), dtype=np.float32).reshape(3, 3)
+        lin_vel_body = rot_mat.T @ lin_vel   # body-frame linear velocity
+        ang_vel_body = rot_mat.T @ ang_vel   # body-frame angular velocity
+
+        # Projected gravity in body frame
         gravity_body = rot_mat.T @ np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
-        return np.concatenate([joint_pos, joint_vel, lin_vel, ang_vel, quat, gravity_body])
+        return np.concatenate([joint_pos, joint_vel, lin_vel_body, ang_vel_body, quat, gravity_body])
 
     # ------------------------------------------------------------------
     def _compute_reward(self, obs, torques, smooth_penalty, base_height):

@@ -20,6 +20,7 @@ Directory layout assumed:
           llm_planner_node.py
           skill_translator_node.py
           gnn_policy_node.py
+                    MLP_policy_node.py
 
 Build and source before launching:
   colcon build --symlink-install
@@ -28,7 +29,6 @@ Build and source before launching:
 """
 
 import os
-from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -36,17 +36,14 @@ from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     IncludeLaunchDescription,
-    RegisterEventHandler,
     TimerAction,
 )
-from launch.conditions import IfCondition, UnlessCondition
-from launch.event_handlers import OnProcessStart, OnShutdown
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (
     Command,
     LaunchConfiguration,
     PathJoinSubstitution,
-    PythonExpression,
 )
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
@@ -95,14 +92,14 @@ def generate_launch_description():
 
     llm_model_arg = DeclareLaunchArgument(
         "llm_model",
-        default_value="claude-sonnet-4-20250514",
+        default_value="qwen2.5:7b",
         description="LLM model ID string passed to llm_planner_node",
     )
 
-    gnn_checkpoint_arg = DeclareLaunchArgument(
-        "gnn_checkpoint",
-        default_value="",
-        description="Absolute path to .pt GNN checkpoint. Empty = random init.",
+    mlp_checkpoint_arg = DeclareLaunchArgument(
+        "mlp_checkpoint",
+        default_value="/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/Training_MLP/checkpoints/mlp_ppo_7282688.pt",
+        description="Absolute path to .pt MLP checkpoint. Empty = random init.",
     )
 
     log_level_arg = DeclareLaunchArgument(
@@ -286,7 +283,7 @@ def generate_launch_description():
     #    Subscribes:  /scene_graph        (std_msgs/String, JSON)
     #    Publishes:   /llm_action         (std_msgs/String, JSON)
     #
-    #    Calls Anthropic/OpenAI API every 5 s (configurable).
+    #    Calls local Ollama model every 5 s (configurable).
     #    Output schema:
     #    {"skill": "navigate_to", "target": "box_1", "params": {}}
     # -----------------------------------------------------------------------
@@ -307,8 +304,7 @@ def generate_launch_description():
                         "scene_graph_topic":  "/scene_graph",
                         "action_topic":       "/llm_action",
                         "max_tokens":         256,
-                        # API key via environment variable ANTHROPIC_API_KEY
-                        # Do NOT hardcode keys here
+                        "task":               "navigate to the goal",
                     }
                 ],
                 arguments=["--ros-args", "--log-level", LaunchConfiguration("log_level")],
@@ -350,37 +346,52 @@ def generate_launch_description():
     )
 
     # -----------------------------------------------------------------------
-    # 8. GNN policy node
+    # 8. MLP policy node
     #    Subscribes:  /joint_states       (sensor_msgs/JointState)
     #                 /odom               (nav_msgs/Odometry)
-    #                 /goal_pose          (geometry_msgs/PoseStamped)
     #    Publishes:   /cmd_joint_torques  (std_msgs/Float64MultiArray)
     #
-    #    Runs at 20 Hz. Loads PyTorch GNN checkpoint.
-    #    If gnn_checkpoint is empty, runs with random weights (sanity check).
+    #    Runs at 20 Hz. Loads PyTorch MLP checkpoint.
+    #    If mlp_checkpoint is empty, runs with random weights (sanity check).
     # -----------------------------------------------------------------------
 
-    gnn_policy_node = TimerAction(
-    period=2.5,
-    actions=[
-        ExecuteProcess(
-            cmd=[
-                '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/.venv/bin/python',
-                '/mnt/newvolume/Programming/Python/Deep_Learning/'
-                'Relational_Bias_for_Morphological_Generalization/'
-                'morpho_gnn_robot/gnn_policy_node.py',
-                '--checkpoint',
-                '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/gnn_ppo_301056.pt',
-                '--urdf',
-                '/mnt/newvolume/Programming/Python/Deep_Learning/'
-                'Relational_Bias_for_Morphological_Generalization/'
-                'morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/urdf/anymal.urdf',
-                '--device', 'cuda',
-            ],
-            output='screen',
-        )
-    ],
-)
+    mlp_policy_node = TimerAction(
+        period=7.0,
+        actions=[
+            ExecuteProcess(
+                cmd=[
+                    '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/.venv/bin/python',
+                    '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/morpho_robot/MLP_policy_node.py',
+                    '--checkpoint',
+                    LaunchConfiguration("mlp_checkpoint"),
+                    '--urdf',
+                    PathJoinSubstitution([FindPackageShare(PKG), "urdf", LaunchConfiguration("urdf")]),
+                    '--device', 'cuda',
+                ],
+                output='screen',
+            )
+        ],
+    )
+
+    #    gnn_policy_node = TimerAction(
+    #     period=2.5,
+    #     actions=[
+    #         ExecuteProcess(
+    #             cmd=[
+    #                 '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/.venv/bin/python',
+    #                 '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/morpho_robot/gnn_policy_node.py',
+    #                 '--checkpoint',
+    #                 '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/Training_Location/checkpoints/gnn_ppo_4272128.pt',
+    #                 '--urdf',
+    #                 '/mnt/newvolume/Programming/Python/Deep_Learning/'
+    #                 'Relational_Bias_for_Morphological_Generalization/'
+    #                 'morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/urdf/anymal.urdf',
+    #                 '--device', 'cuda',
+    #             ],
+    #             output='screen',
+    #         )
+    #     ],
+    # )
 
     # -----------------------------------------------------------------------
     # 9. Optional RViz2
@@ -409,7 +420,7 @@ def generate_launch_description():
             world_arg,
             use_rviz_arg,
             llm_model_arg,
-            gnn_checkpoint_arg,
+            mlp_checkpoint_arg,
             log_level_arg,
             # Nodes -- order matters due to TimerAction delays
             robot_state_publisher,  # immediate
@@ -417,9 +428,9 @@ def generate_launch_description():
             spawn_robot,            # +2 s
             gz_bridge,              # +4 s
             vision_node,            # +5 s
-            #llm_planner_node,       # +5 s
+            llm_planner_node,       # +5 s
             skill_translator_node,  # +5 s
-            gnn_policy_node,        # +2.5 s
+            mlp_policy_node,        # +2.5 s
             rviz,                   # conditional
         ]
     )

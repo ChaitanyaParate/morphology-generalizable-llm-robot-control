@@ -39,7 +39,7 @@ except ImportError as exc:
 
 
 CONTROL_HZ = 120
-POSITION_SCALE = 0.45
+POSITION_SCALE = 0.80  # must match action_scale in robot_env_bullet.py
 JOINT_COMMAND_FMT = "/model/robot/joint/{}/cmd_pos"
 HIDDEN_DIM = 256
 OBS_NORM_DIM = 30
@@ -106,7 +106,14 @@ class MLPActorCritic(torch.nn.Module):
 
 
 class MLPPolicyNode(Node):
-    def __init__(self, checkpoint_path: str, urdf_path: str, device_str: str):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        urdf_path: str,
+        device_str: str,
+        action_remap: str,
+        odom_in_base_frame: bool,
+    ):
         super().__init__("MLP_policy_node")
         self.device = torch.device(device_str)
         self.get_logger().info(f"Device: {self.device}")
@@ -115,6 +122,17 @@ class MLPPolicyNode(Node):
         self.builder = URDFGraphBuilder(urdf_path, add_body_node=True)
         self.get_logger().info(
             f"Joint order: {self.builder.joint_names} | joints={self.builder.num_joints}"
+        )
+
+        self._action_remap_idx = self._build_action_remap(action_remap)
+        if self._action_remap_idx is None:
+            self.get_logger().info("Action remap: none")
+        else:
+            self.get_logger().info(f"Action remap: {action_remap}")
+
+        self._odom_in_base_frame = odom_in_base_frame
+        self.get_logger().info(
+            f"Odom twist frame: {'base' if self._odom_in_base_frame else 'world'}"
         )
 
         # In training, only obs[:30] was normalized. Reuse checkpoint stats here.
@@ -176,6 +194,31 @@ class MLPPolicyNode(Node):
                 lower[i], upper[i] = limits_by_name[jname]
 
         return lower, upper
+
+    def _build_action_remap(self, mode: str):
+        if mode == "none":
+            return None
+
+        if mode == "rotate_cw":
+            leg_map = {"LF": "LH", "RF": "LF", "RH": "RF", "LH": "RH"}
+        elif mode == "rotate_ccw":
+            leg_map = {"LF": "RF", "RF": "RH", "RH": "LH", "LH": "LF"}
+        else:
+            raise ValueError(f"Unknown action_remap mode: {mode}")
+
+        name_to_idx = {name: idx for idx, name in enumerate(self.builder.joint_names)}
+        remap = []
+        for jname in self.builder.joint_names:
+            parts = jname.split("_", 1)
+            if len(parts) != 2:
+                remap.append(name_to_idx[jname])
+                continue
+            leg, suffix = parts
+            source_leg = leg_map.get(leg, leg)
+            source_name = f"{source_leg}_{suffix}"
+            remap.append(name_to_idx.get(source_name, name_to_idx[jname]))
+
+        return np.array(remap, dtype=np.int64)
 
     def _load_checkpoint(self, path: str) -> MLPActorCritic:
         self.get_logger().info(f"Loading checkpoint: {path}")
@@ -313,6 +356,11 @@ class MLPPolicyNode(Node):
             ],
             dtype=np.float32,
         )
+
+        if not self._odom_in_base_frame:
+            base_lin_vel = rot_mat.T @ base_lin_vel
+            base_ang_vel = rot_mat.T @ base_ang_vel
+
         gravity_body = rot_mat.T @ np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
         obs = np.concatenate([pos, vel, base_lin_vel, base_ang_vel, base_quat, gravity_body]).astype(np.float32)
@@ -325,6 +373,10 @@ class MLPPolicyNode(Node):
             action = mean
 
         action_np = action.squeeze(0).cpu().numpy()
+
+        if self._action_remap_idx is not None:
+            action_np = action_np[self._action_remap_idx]
+
         action_np = np.clip(action_np, -1.0, 1.0)
         action_np = (1.0 - ACTION_SMOOTH_ALPHA) * self._prev_action + ACTION_SMOOTH_ALPHA * action_np
         self._prev_action = action_np.copy()
@@ -353,10 +405,29 @@ def main():
     parser.add_argument("--checkpoint", required=True, help="Path to .pt file")
     parser.add_argument("--urdf", required=True, help="Path to URDF")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument(
+        "--action_remap",
+        default="none",
+        choices=["none", "rotate_cw", "rotate_ccw"],
+        help="Remap actions to rotate gait direction",
+    )
+    parser.add_argument(
+        "--odom_in_base_frame",
+        default=1,
+        type=int,
+        choices=[0, 1],
+        help="Interpret /odom twist in base frame (1) or world frame (0)",
+    )
     args, _ = parser.parse_known_args()
 
     rclpy.init()
-    node = MLPPolicyNode(args.checkpoint, args.urdf, args.device)
+    node = MLPPolicyNode(
+        args.checkpoint,
+        args.urdf,
+        args.device,
+        args.action_remap,
+        bool(args.odom_in_base_frame),
+    )
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

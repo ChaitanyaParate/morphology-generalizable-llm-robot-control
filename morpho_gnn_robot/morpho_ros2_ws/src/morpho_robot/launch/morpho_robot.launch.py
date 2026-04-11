@@ -98,7 +98,7 @@ def generate_launch_description():
 
     mlp_checkpoint_arg = DeclareLaunchArgument(
         "mlp_checkpoint",
-        default_value="/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/Training_MLP/checkpoints/mlp_ppo_983040.pt",
+        default_value="/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/Training_MLP/checkpoints/mlp_ppo_630784.pt",
         description="Absolute path to .pt MLP checkpoint. Empty = random init.",
     )
 
@@ -106,6 +106,26 @@ def generate_launch_description():
         "log_level",
         default_value="info",
         description="ROS2 logger level: debug | info | warn | error",
+    )
+
+    spawn_yaw_arg = DeclareLaunchArgument(
+        "spawn_yaw",
+        default_value="0.0",
+        description="Robot spawn yaw in radians",
+    )
+
+    action_remap_arg = DeclareLaunchArgument(
+        "action_remap",
+        default_value="none",
+        description="Rotate gait direction: none | rotate_cw | rotate_ccw",
+    )
+
+    odom_in_base_frame_arg = DeclareLaunchArgument(
+        "odom_in_base_frame",
+        default_value="1",
+        description="Treat /odom twist as base frame (1) or world frame (0). "
+                    "Set to 1 for models trained with body-frame velocities (correct). "
+                    "Set to 0 only for legacy checkpoints trained with world-frame velocities.",
     )
 
     # -----------------------------------------------------------------------
@@ -198,6 +218,7 @@ def generate_launch_description():
                     "-x",     "0.0",
                     "-y",     "0.0",
                     "-z",     "1.0",   # spawn slightly above ground
+                    "-Y",     LaunchConfiguration("spawn_yaw"),
                 ],
             )
         ],
@@ -367,6 +388,8 @@ def generate_launch_description():
                     '--urdf',
                     PathJoinSubstitution([FindPackageShare(PKG), "urdf", LaunchConfiguration("urdf")]),
                     '--device', 'cuda',
+                    '--action_remap', LaunchConfiguration("action_remap"),
+                    '--odom_in_base_frame', LaunchConfiguration("odom_in_base_frame"),
                 ],
                 output='screen',
             )
@@ -421,7 +444,10 @@ def generate_launch_description():
             use_rviz_arg,
             llm_model_arg,
             mlp_checkpoint_arg,
+            action_remap_arg,
+            odom_in_base_frame_arg,
             log_level_arg,
+            spawn_yaw_arg,
             # Nodes -- order matters due to TimerAction delays
             robot_state_publisher,  # immediate
             *gazebo,                 # immediate

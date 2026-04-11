@@ -19,6 +19,7 @@ meshes/anymal_thigh_l.dae
 meshes/anymal_thigh_r.dae
 meshes/base_uv_texture.jpg
 meshes/carbon_uv_texture.jpg
+morpho_robot/MLP_policy_node.py
 morpho_robot/__init__.py
 morpho_robot/gnn_actor_critic.py
 morpho_robot/gnn_policy_node.py
