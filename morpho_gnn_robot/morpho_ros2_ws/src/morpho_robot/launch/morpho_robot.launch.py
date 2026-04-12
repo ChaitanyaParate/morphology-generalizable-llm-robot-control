@@ -98,7 +98,7 @@ def generate_launch_description():
 
     mlp_checkpoint_arg = DeclareLaunchArgument(
         "mlp_checkpoint",
-        default_value="/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/Training_MLP/checkpoints/mlp_ppo_5533696.pt",
+        default_value="/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/Training_MLP/checkpoints/mlp_ppo_6303744.pt",
         description="Absolute path to .pt MLP checkpoint. Empty = random init.",
     )
 
@@ -216,7 +216,7 @@ def generate_launch_description():
                     "-world", "robot_world",
                     "-x",     "0.0",
                     "-y",     "0.0",
-                    "-z",     "1.0",   # spawn slightly above ground
+                    "-z",     "0.5",   # Final stabilized height
                     "-Y",     LaunchConfiguration("spawn_yaw"),
                 ],
             )

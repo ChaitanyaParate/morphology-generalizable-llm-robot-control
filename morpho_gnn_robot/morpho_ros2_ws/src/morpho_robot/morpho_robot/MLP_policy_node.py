@@ -38,21 +38,20 @@ except ImportError as exc:
     raise SystemExit(1)
 
 
-CONTROL_HZ = 200
-POSITION_SCALE = 0.80  # must match action_scale in robot_env_bullet.py
+# Nominal standing pose matching robot_env_bullet.py conventions
+NOMINAL_POSE_PER_JOINT = {
+    'LF_HAA': 0.0, 'LF_HFE': 0.6, 'LF_KFE': -1.2,
+    'RF_HAA':  0.0, 'RF_HFE': 0.6, 'RF_KFE': -1.2,
+    'LH_HAA':  0.0, 'LH_HFE': -0.6, 'LH_KFE': 1.2,
+    'RH_HAA':  0.0, 'RH_HFE': -0.6, 'RH_KFE': 1.2
+}
+POSITION_SCALE = 0.5
 JOINT_COMMAND_FMT = "/model/robot/joint/{}/cmd_pos"
 HIDDEN_DIM = 256
-OBS_NORM_DIM = 30
-ACTION_SMOOTH_ALPHA = 0.75  # Reduced smoothing for faster response
-MAX_CMD_STEP = 0.25        # Relaxed step limit to allow standing up quickly
-STARTUP_HOLD_TICKS = 200       # Hold nominal pose for 1 second to settle
-
-NOMINAL_POSE_PER_JOINT = {
-    "LF_HAA": 0.0,  "LF_HFE": 0.6,  "LF_KFE": -1.2,
-    "RF_HAA": 0.0,  "RF_HFE": 0.6,  "RF_KFE": -1.2,
-    "LH_HAA": 0.0,  "LH_HFE": -0.6, "LH_KFE": 1.2,
-    "RH_HAA": 0.0,  "RH_HFE": -0.6, "RH_KFE": 1.2,
-}
+OBS_NORM_DIM = 37
+ACTION_SMOOTH_ALPHA = 0.85
+MAX_CMD_STEP = 0.2
+STARTUP_HOLD_TICKS = 400
 
 
 def _layer_init(layer, std=0.01, bias_const=0.0):
@@ -166,17 +165,18 @@ class MLPPolicyNode(Node):
         self._odom_ready = False
         self._cmd_initialized = False
 
-        self.create_subscription(JointState, "/joint_states", self._cb_joint_states, 10)
-        self.create_subscription(Odometry, "/odom", self._cb_odom, 10)
+        from rclpy.qos import qos_profile_sensor_data
+        self.create_subscription(JointState, "/joint_states", self._cb_joint_states, qos_profile_sensor_data)
+        self.create_subscription(Odometry, "/odom", self._cb_odom, qos_profile_sensor_data)
 
         self._joint_pubs = {
             jname: self.create_publisher(Float64, JOINT_COMMAND_FMT.format(jname), 10)
             for jname in self.builder.joint_names
         }
-        self.create_timer(1.0 / CONTROL_HZ, self._control_cb)
+        self.create_timer(1.0 / 200, self._control_cb)
 
         self.get_logger().info(
-            f"Ready. Publishing {self.builder.num_joints} joint commands to '{JOINT_COMMAND_FMT}' at {CONTROL_HZ} Hz."
+            f"Ready. Publishing {self.builder.num_joints} joint commands to '{JOINT_COMMAND_FMT}' at 200 Hz."
         )
 
     def _load_joint_limits(self, urdf_path: str):
@@ -266,8 +266,9 @@ class MLPPolicyNode(Node):
         return model
 
     def _normalize_policy_obs(self, obs: np.ndarray) -> np.ndarray:
-        head = obs[:OBS_NORM_DIM]
-        tail = obs[OBS_NORM_DIM:]
+        norm_dim = self._obs_norm_mean.shape[0]
+        head = obs[:norm_dim]
+        tail = obs[norm_dim:]
         denom = np.sqrt(self._obs_norm_var) + 1e-8
         head_n = np.clip((head - self._obs_norm_mean) / denom, -10.0, 10.0)
         return np.concatenate([head_n, tail], axis=0).astype(np.float32)
@@ -307,12 +308,22 @@ class MLPPolicyNode(Node):
         else:
             quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         with self._lock:
+            if not self._odom_ready:
+                self.get_logger().info("✅ ODOM CONNECTED: Sensor bridge established.")
             self._base_quat = quat
             self._base_lin_vel = np.array([tw.linear.x, tw.linear.y, tw.linear.z], dtype=np.float32)
             self._base_ang_vel = np.array([tw.angular.x, tw.angular.y, tw.angular.z], dtype=np.float32)
             self._odom_ready = True
 
     def _control_cb(self):
+        try:
+            self._do_control()
+        except Exception as e:
+            self.get_logger().error(f"FATAL ERROR in control loop: {e}", throttle_duration_sec=2.0)
+            import traceback
+            self.get_logger().error(traceback.format_exc(), throttle_duration_sec=2.0)
+
+    def _do_control(self):
         if not self._joint_ready:
             return
 
@@ -381,23 +392,25 @@ class MLPPolicyNode(Node):
                 if jname in self._joint_pubs:
                     self._joint_pubs[jname].publish(Float64(data=NOMINAL_POSE_PER_JOINT[jname]))
             self._ticks += 1
+            if self._ticks == STARTUP_HOLD_TICKS:
+                self.get_logger().info("🚀 POLICY ACTIVE: Neural network taking control.")
+                self._last_telemetry_time = self.get_clock().now() - rclpy.duration.Duration(seconds=2.0)
             return
 
         # 4. Telemetry (1Hz)
         now = self.get_clock().now()
         if (now - self._last_telemetry_time).nanoseconds > 1e9:
-            # gravity_body[0] is roughly -sin(pitch). 
-            # If robot tilts forward (nose down), gravity_body[0] becomes positive.
             pitch_est = -gravity_body[0]
+            roll_est  = gravity_body[1]
+            action_mag = np.mean(np.abs(self._prev_action))
             self.get_logger().info(
-                f"Telemetery | Pitch: {pitch_est:.2f} | FwdVel: {base_lin_vel[0]:.2f} | Ticks: {self._ticks}"
+                f"Telemetery | P/R: {pitch_est:.2f}/{roll_est:.2f} | Act: {action_mag:.3f} | "
+                f"QuatRaw: [{base_quat[0]:.2f},{base_quat[1]:.2f},{base_quat[2]:.2f},{base_quat[3]:.2f}] | "
+                f"Joint0: {pos[0]:.2f}"
             )
             self._last_telemetry_time = now
 
         # 5. Neural Network Inference
-        obs = np.concatenate([pos, vel, base_lin_vel, base_ang_vel, base_quat, gravity_body]).astype(np.float32)
-
-        # 4. Neural Network Inference
         obs = np.concatenate([pos, vel, base_lin_vel, base_ang_vel, base_quat, gravity_body]).astype(np.float32)
         obs_n = self._normalize_policy_obs(obs)
         obs_t = torch.tensor(obs_n, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -416,11 +429,11 @@ class MLPPolicyNode(Node):
         action_np = (1.0 - ACTION_SMOOTH_ALPHA) * self._prev_action + ACTION_SMOOTH_ALPHA * action_np
         self._prev_action = action_np.copy()
 
-        # 6. Safety Ramp: gradually allow larger movements
-        # During the first 400 ticks (2s) of policy activation, clamp the action magnitude
+        # Safety Ramp: reach full power over 2.0s
         ramp_ticks = 400
         policy_ticks = self._ticks - STARTUP_HOLD_TICKS
-        ramp_factor = min(1.0, float(policy_ticks) / ramp_ticks)
+        ramp_factor = max(0.0, min(1.0, float(policy_ticks) / ramp_ticks))
+        self._ticks += 1
 
         cmd_pos = []
         for i, jname in enumerate(self.builder.joint_names):
@@ -476,7 +489,8 @@ def main():
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
