@@ -6,27 +6,30 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-
 def call_llm_planner(task: str, scene: dict, model: str) -> dict:
-    response = ollama.chat(
-        model=model,
-        format="json",
-        options={"temperature": 0.1},
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a robot planner. Output ONLY JSON with keys: "
-                    "skill (string), target (string), params (dict)."
-                )
-            },
-            {
-                "role": "user",
-                "content": f"Task: {task}\nScene: {json.dumps(scene)}"
-            }
-        ]
-    )
-    return json.loads(response["message"]["content"])
+    try:
+        response = ollama.chat(
+            model=model,
+            format="json",
+            options={"temperature": 0.1},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a robot planner. Output ONLY JSON with keys: "
+                        "skill (string), target (string), params (dict)."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Task: {task}\nScene: {json.dumps(scene)}"
+                }
+            ]
+        )
+        return json.loads(response["message"]["content"])
+    except Exception as e:
+        print(f"[WARN] Local LLM server directly unavailable: {e}. Outputting default navigation fallback.")
+        return {"skill": "trot", "target": "waypoint", "params": {"x": 5.0, "y": 0.0, "velocity": 0.35}}
 
 class LLMPlannerNode(Node):
     def __init__(self):

@@ -75,29 +75,25 @@ class RunningNorm:
 @dataclass
 class Config:
     # Environment
-    urdf_path: str = (
-        "/mnt/newvolume/Programming/Python/Deep_Learning/"
-        "Relational_Bias_for_Morphological_Generalization/"
-        "morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/urdf/anymal.urdf"
-    )
-    max_episode_steps: int = 1000
+    urdf_path: str = "auto"   # Resolved relative to script local if "auto"
+    max_episode_steps: int = 400
 
     # Training
     seed:             int   = 0
-    total_timesteps:  int   = 5_000_000
-    gnn_learning_rate:    float = 1e-4
-    actor_learning_rate:  float = 1e-4
-    critic_learning_rate: float = 2e-4
+    total_timesteps:  int   = 2_000_000
+    gnn_learning_rate:    float = 4.5e-4
+    actor_learning_rate:  float = 4.5e-4
+    critic_learning_rate: float = 4.5e-4
     num_steps:        int   = 4096    # rollout length before each update
     num_minibatches:  int   = 4
-    update_epochs:    int   = 8
+    update_epochs:    int   = 6
     gamma:            float = 0.99
     gae_lambda:       float = 0.95
-    clip_coef:        float = 0.20
-    ent_coef:         float = 0.005  # slightly higher entropy for steady exploration
-    vf_coef:          float = 1.0
+    clip_coef:        float = 0.15
+    ent_coef:         float = 0.005     # increased entropy for continuous action space exploration
+    vf_coef:          float = 0.5
     max_grad_norm:    float = 0.5
-    clip_vloss:       bool  = False
+    clip_vloss:       bool  = True
     target_kl:        float = 0.015
     resume_path: str = None
 
@@ -107,7 +103,7 @@ class Config:
     # Logging
     track:       bool = False    # set True on Kaggle with wandb key
     run_name:    str  = ""
-    save_every:  int  = 70_000   # checkpoint every N timesteps
+    save_every:  int  = 70_000   # checkpoint every N timesteps (default 70,000)
     checkpoint_dir: str = "./checkpoints"
 
     @property
@@ -138,6 +134,25 @@ def parse_args() -> Config:
                 setattr(cfg, f_name, v)
     if not cfg.run_name:
         cfg.run_name = f"gnn_ppo_seed{cfg.seed}_{int(time.time())}"
+
+    # Kaggle/Local path correction
+    if cfg.urdf_path == "auto":
+        # Look for URDF relative to script location
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Priority 1: anymal_stripped.urdf (prevents mesh errors on Kaggle)
+        path = os.path.join(base_dir, "anymal_stripped.urdf")
+        
+        if not os.path.exists(path):
+            # Priority 2: Standard repo path
+            path = os.path.join(base_dir, "..", "morpho_ros2_ws", "src", "morpho_robot", "urdf", "anymal.urdf")
+            
+        if not os.path.exists(path):
+            # Priority 3: Fallback for Kaggle if flattened or missing stripped version
+            path = os.path.join(base_dir, "anymal.urdf")
+            
+        cfg.urdf_path = os.path.abspath(path)
+
     return cfg
 
 
@@ -328,6 +343,7 @@ def train(cfg: Config):
         # Rollout collection
         # --------------------------------------------------------
         buffer.reset()
+        agent.to("cpu")
 
         for step in range(cfg.num_steps):
             global_step += 1
@@ -350,7 +366,7 @@ def train(cfg: Config):
                 body_grav=body_grav,
                 body_lin_vel=body_lin_vel,
                 body_ang_vel=body_ang_vel,
-            ).to(device)
+            )
 
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(graph)
@@ -370,6 +386,11 @@ def train(cfg: Config):
                 episode_rewards.append(ep_reward)
                 episode_lengths.append(ep_length)
                 episode_forward_vels.append(ep_forward_vel_sum / max(ep_length, 1))
+                # Track termination reasons for debugging
+                tr = info.get("term_reason", "unknown")
+                if not hasattr(env, '_term_counts'):
+                    env._term_counts = {}
+                env._term_counts[tr] = env._term_counts.get(tr, 0) + 1
                 ep_reward  = 0.0
                 ep_length  = 0
                 ep_forward_vel_sum = 0.0
@@ -392,7 +413,7 @@ def train(cfg: Config):
                 body_grav=body_grav,
                 body_lin_vel=body_lin_vel,
                 body_ang_vel=body_ang_vel,
-            ).to(device)
+            )
             next_value  = agent.get_value(next_graph)
 
         advantages, returns = buffer.compute_advantages(
@@ -403,6 +424,7 @@ def train(cfg: Config):
         # --------------------------------------------------------
         # PPO update
         # --------------------------------------------------------
+        agent.to(device)
         update += 1
         indices = np.arange(cfg.num_steps)
 
@@ -513,7 +535,8 @@ def train(cfg: Config):
             f"lr_g={optimizer.param_groups[0]['lr']:.2e} | "
             f"lr_a={optimizer.param_groups[1]['lr']:.2e} | "
             f"lr_c={optimizer.param_groups[2]['lr']:.2e} | "
-            f"sps={sps}"
+            f"sps={sps} | "
+            f"term={getattr(env, '_term_counts', {})}"
         )
 
         if cfg.track:

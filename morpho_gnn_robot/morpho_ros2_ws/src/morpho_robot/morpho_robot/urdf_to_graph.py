@@ -10,12 +10,12 @@ Edges  : joint A -> joint B  iff  A.child_link == B.parent_link
          All edges are bidirectional (forward + reverse stored separately)
 
 Node features
-  Static  (URDF, computed once) : [type_onehot(4), axis(3), lower, upper, effort, velocity]  ->  11
-  Runtime (injected each step)  : [joint_pos, joint_vel]                                      ->   2
-  Total                         :                                                                  20
+    Static  (URDF, computed once) : [type_onehot(4), axis(3), lower, upper, effort, velocity]  ->  11
+    Runtime (injected each step)  : [joint_pos, joint_vel] + body-only [quat(4), grav(3), lin_vel(3), ang_vel(3)]  ->  15
+    Total                         :                                                                  26
 
-  NOTE: NODE_DIM is now 20 (was 13 before body orientation was added).
-  gnn_actor_critic.py must be constructed with node_dim=20.
+    NOTE: NODE_DIM is now 26 (was 20 before base velocity was added).
+    gnn_actor_critic.py must be constructed with node_dim=26.
 
 Edge features : [origin(3), direction(1)]  ->  4
   direction = +1.0 for parent->child, -1.0 for child->parent
@@ -56,9 +56,9 @@ CONTROLLABLE   = {"revolute", "continuous", "prismatic"}
 
 STATIC_DIM      = 11   # type_onehot(4) + axis(3) + limits(4)
 JOINT_RUNTIME   = 2    # joint_pos, joint_vel
-BODY_EXTRA      = 7    # quat(4) + projected_gravity(3)
-RUNTIME_DIM     = JOINT_RUNTIME + BODY_EXTRA   # 9
-NODE_DIM        = STATIC_DIM + RUNTIME_DIM     # 20
+BODY_EXTRA      = 13   # quat(4) + projected_gravity(3) + lin_vel(3) + ang_vel(3)
+RUNTIME_DIM     = JOINT_RUNTIME + BODY_EXTRA   # 15
+NODE_DIM        = STATIC_DIM + RUNTIME_DIM     # 26
 
 EDGE_DIM        = 4
 
@@ -212,8 +212,10 @@ class URDFGraphBuilder:
                     continue
                 k      = self.joint_to_idx[downstream]
                 origin = _xyz(all_joints[downstream].find("origin"))
-                edges.append((i, k));  efeats.append(origin + [1.0])
-                edges.append((k, i));  efeats.append(origin + [-1.0])
+                edges.append((i, k))
+                efeats.append(origin + [1.0])
+                edges.append((k, i))
+                efeats.append(origin + [-1.0])
 
         if self.add_body_node:
             body = 0
@@ -223,8 +225,10 @@ class URDFGraphBuilder:
                 if pl in root_links:
                     k      = self.joint_to_idx[jname]
                     origin = _xyz(j.find("origin"))
-                    edges.append((body, k));  efeats.append(origin + [1.0])
-                    edges.append((k, body));  efeats.append(origin + [-1.0])
+                    edges.append((body, k))
+                    efeats.append(origin + [1.0])
+                    edges.append((k, body))
+                    efeats.append(origin + [-1.0])
 
         if edges:
             self._edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
@@ -266,6 +270,8 @@ class URDFGraphBuilder:
         joint_vel:   Optional[np.ndarray] = None,
         body_quat:   Optional[np.ndarray] = None,
         body_grav:   Optional[np.ndarray] = None,
+        body_lin_vel: Optional[np.ndarray] = None,
+        body_ang_vel: Optional[np.ndarray] = None,
     ) -> Data:
         """
         Build a PyG Data for one RL timestep.
@@ -275,6 +281,8 @@ class URDFGraphBuilder:
         vel  = joint_vel if joint_vel is not None else np.zeros(self.num_joints)
         quat = body_quat if body_quat is not None else np.array([0., 0., 0., 1.], dtype=np.float32)
         grav = body_grav if body_grav is not None else np.array([0., 0., -1.], dtype=np.float32)
+        lin_vel = body_lin_vel if body_lin_vel is not None else np.zeros(3, dtype=np.float32)
+        ang_vel = body_ang_vel if body_ang_vel is not None else np.zeros(3, dtype=np.float32)
 
         joint_runtime = np.zeros((self.num_joints, RUNTIME_DIM), dtype=np.float32)
         joint_runtime[:, 0] = pos
@@ -286,13 +294,15 @@ class URDFGraphBuilder:
             body_runtime = np.zeros((1, RUNTIME_DIM), dtype=np.float32)
             body_runtime[0, 2:6] = quat
             body_runtime[0, 6:9] = grav
+            body_runtime[0, 9:12] = lin_vel
+            body_runtime[0, 12:15] = ang_vel
             runtime = torch.cat(
                 [torch.tensor(body_runtime, dtype=torch.float), runtime_joints], dim=0
             )
         else:
             runtime = runtime_joints
 
-        x = torch.cat([self._static_x, runtime], dim=1)  # [num_nodes, 20]
+        x = torch.cat([self._static_x, runtime], dim=1)  # [num_nodes, 26]
 
         return Data(
             x          = x,

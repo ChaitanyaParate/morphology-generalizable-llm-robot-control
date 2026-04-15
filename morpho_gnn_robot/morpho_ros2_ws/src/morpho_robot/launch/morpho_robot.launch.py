@@ -38,7 +38,7 @@ from launch.actions import (
     IncludeLaunchDescription,
     TimerAction,
 )
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, LaunchConfigurationEquals
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (
     Command,
@@ -94,6 +94,18 @@ def generate_launch_description():
         "llm_model",
         default_value="qwen2.5:7b",
         description="LLM model ID string passed to llm_planner_node",
+    )
+
+    policy_type_arg = DeclareLaunchArgument(
+        "policy_type",
+        default_value="mlp",
+        description="Which policy to run: mlp | gnn",
+    )
+
+    gnn_checkpoint_arg = DeclareLaunchArgument(
+        "gnn_checkpoint",
+        default_value="",
+        description="Absolute path to .pt GNN checkpoint",
     )
 
     mlp_checkpoint_arg = DeclareLaunchArgument(
@@ -386,6 +398,7 @@ def generate_launch_description():
         period=7.0,
         actions=[
             ExecuteProcess(
+                condition=LaunchConfigurationEquals("policy_type", "mlp"),
                 cmd=[
                     '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/.venv/bin/python',
                     '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/morpho_robot/MLP_policy_node.py',
@@ -403,25 +416,24 @@ def generate_launch_description():
         ],
     )
 
-    #    gnn_policy_node = TimerAction(
-    #     period=2.5,
-    #     actions=[
-    #         ExecuteProcess(
-    #             cmd=[
-    #                 '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/.venv/bin/python',
-    #                 '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/morpho_robot/gnn_policy_node.py',
-    #                 '--checkpoint',
-    #                 '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/Training_Location/checkpoints/gnn_ppo_4272128.pt',
-    #                 '--urdf',
-    #                 '/mnt/newvolume/Programming/Python/Deep_Learning/'
-    #                 'Relational_Bias_for_Morphological_Generalization/'
-    #                 'morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/urdf/anymal.urdf',
-    #                 '--device', 'cuda',
-    #             ],
-    #             output='screen',
-    #         )
-    #     ],
-    # )
+    gnn_policy_node = TimerAction(
+        period=7.0,
+        actions=[
+            ExecuteProcess(
+                condition=LaunchConfigurationEquals("policy_type", "gnn"),
+                cmd=[
+                    '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/.venv/bin/python',
+                    '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/morpho_robot/gnn_policy_node.py',
+                    '--checkpoint',
+                    LaunchConfiguration("gnn_checkpoint"),
+                    '--urdf',
+                    PathJoinSubstitution([FindPackageShare(PKG), "urdf", LaunchConfiguration("urdf")]),
+                    '--device', 'cuda',
+                ],
+                output='screen',
+            )
+        ],
+    )
 
     # -----------------------------------------------------------------------
     # 9. Optional RViz2
@@ -450,6 +462,8 @@ def generate_launch_description():
             world_arg,
             use_rviz_arg,
             llm_model_arg,
+            policy_type_arg,
+            gnn_checkpoint_arg,
             mlp_checkpoint_arg,
             action_remap_arg,
             odom_in_base_frame_arg,
@@ -464,7 +478,8 @@ def generate_launch_description():
             vision_node,            # +5 s
             llm_planner_node,       # +5 s
             skill_translator_node,  # +5 s
-            mlp_policy_node,        # +2.5 s
+            mlp_policy_node,        # +7.0 s
+            gnn_policy_node,        # +7.0 s
             rviz,                   # conditional
         ]
     )

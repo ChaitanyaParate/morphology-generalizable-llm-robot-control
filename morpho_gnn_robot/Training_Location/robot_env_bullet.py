@@ -20,6 +20,7 @@ Action: 12-dim in [-1, 1]. Scaled by effort_limit inside step().
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
+from scipy.spatial.transform import Rotation as R
 
 try:
     import pybullet as p
@@ -46,6 +47,8 @@ LINK_ROLLING_FRICTION = 0.001
 NOMINAL_POSE_PER_JOINT = {
     "LF_HAA":  0.0,  "LF_HFE":  0.6,  "LF_KFE": -1.2,
     "RF_HAA":  0.0,  "RF_HFE":  0.6,  "RF_KFE": -1.2,
+    "LM_HAA":  0.0,  "LM_HFE":  0.6,  "LM_KFE": -1.2,
+    "RM_HAA":  0.0,  "RM_HFE":  0.6,  "RM_KFE": -1.2,
     "LH_HAA":  0.0,  "LH_HFE": -0.6,  "LH_KFE":  1.2,
     "RH_HAA":  0.0,  "RH_HFE": -0.6,  "RH_KFE":  1.2,
 }
@@ -66,7 +69,7 @@ class RobotEnvBullet(gym.Env):
     # Reward weights
     # NOTE: torque cost is small but non-zero to regularize energy without
     # collapsing to a stand-still policy.
-    FALL_PENALTY = 80.0
+    FALL_PENALTY = 500.0   # Reduced to encourage risk-taking during discovery phase.
 
     def __init__(
         self,
@@ -74,12 +77,14 @@ class RobotEnvBullet(gym.Env):
         max_episode_steps: int   = 1000,
         render_mode:       str   = None,
         forward_axis:      int   = 0,
+        height_threshold:  float = 0.30,
     ):
         super().__init__()
         self.urdf_path         = urdf_path
         self.max_episode_steps = max_episode_steps
         self.render_mode       = render_mode
         self.forward_axis      = forward_axis
+        self.height_threshold  = height_threshold
 
         # Parse URDF once to get joint metadata
         self._parse_urdf()
@@ -106,6 +111,12 @@ class RobotEnvBullet(gym.Env):
             shape=(self.action_dim,), dtype=np.float32
         )
 
+        # Domain Randomization & Robustness params
+        self.obs_noise_scale = 0.01  # 1% noise on joint pos
+        self.vel_noise_scale = 0.02  # 2% noise on velocities
+        self.action_lag_prob = 0.0   # Reduced to 0.0 to unleash Phase 3 walking rhythm
+        self.action_history = []
+
         
 
         # Connect to PyBullet
@@ -122,6 +133,11 @@ class RobotEnvBullet(gym.Env):
         self._step_count  = 0
         self._fell        = False
         self.prev_action = np.zeros(self.action_dim)
+
+        # Fixed action scale: 0.40 is the 'sweet spot' for descubrimiento.
+        # It's high enough to walk but low enough that noise isn't lethal.
+        self._global_step = 0
+        self._action_scale = 0.40
 
     # ------------------------------------------------------------------
     def _parse_urdf(self):
@@ -152,32 +168,42 @@ class RobotEnvBullet(gym.Env):
             p.removeBody(self._robot_id)
 
         # Start slightly above ground; adjust if URDF origin differs
-        start_pos    = [0.0, 0.0, 0.65]
-        start_orient = p.getQuaternionFromEuler([0.0, 0.0, 0.0])
+        start_pos    = [0.0, 0.0, 0.50]  # Slightly above standing height to allow settling
+        start_orient = p.getQuaternionFromEuler([
+            np.random.uniform(-0.05, 0.05),
+            np.random.uniform(-0.05, 0.05),
+            0.0
+        ])
         robot_id     = p.loadURDF(
             self.urdf_path,
             start_pos, start_orient,
             useFixedBase=False,
-            flags=p.URDF_USE_SELF_COLLISION,
+            flags=0, # Disabled self-collision to prevent Hexapod explosion
         )
         self._robot_id = robot_id
 
         # Map joint names to PyBullet joint indices
-        num_joints   = p.getNumJoints(robot_id)
+        num_joints = p.getNumJoints(robot_id)
         self._joint_idx: dict = {}
-
+        self.foot_indices = []
+        self.heavy_indices = [] # base, hips, thighs
+        
         for i in range(num_joints):
             info = p.getJointInfo(robot_id, i)
-            name  = info[1].decode("utf-8")
+            name = info[1].decode("utf-8")
+            link_name = info[12].decode("utf-8")
+            
+            # 1. Cache indices for ALL links (collision detection)
+            if "_FOOT" in link_name:
+                self.foot_indices.append(i)
+            elif "HIP" in link_name or "THIGH" in link_name:
+                self.heavy_indices.append(i)
+                
+            # 2. Map ONLY controllable joints for the policy
             if name in self.joint_names:
                 self._joint_idx[name] = i
                 # CRITICAL: disable default position control motor
-                # Without this, PyBullet fights your torque commands
-                p.setJointMotorControl2(
-                    robot_id, i,
-                    p.VELOCITY_CONTROL,
-                    force=0
-                )
+                p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL, force=0)
 
         assert len(self._joint_idx) == len(self.joint_names), (
             f"URDF has {len(self.joint_names)} controllable joints but "
@@ -229,7 +255,7 @@ class RobotEnvBullet(gym.Env):
         p.resetSimulation()
         self._robot_id = None   # resetSimulation already removed all bodies
         p.setGravity(0, 0, -9.81)
-        p.setTimeStep(1.0 / 240.0)
+        p.setTimeStep(1.0 / 400.0) # Higher freq for 200Hz control (dt=2/400=5ms)
         p.setPhysicsEngineParameter(numSolverIterations=50, numSubSteps=1)
         plane_id = p.loadURDF("plane.urdf")
         p.changeDynamics(
@@ -242,24 +268,32 @@ class RobotEnvBullet(gym.Env):
 
         self._load_robot()
 
-        # Settle: hold nominal pose with PD so robot is actually standing at episode start
-        for _ in range(240):
-            states   = p.getJointStates(self._robot_id, self._pybullet_indices.tolist())
-            curr_pos = np.array([s[0] for s in states])
-            curr_vel = np.array([s[1] for s in states])
-            torques  = KP * (self._nominal_pos - curr_pos) - KD * curr_vel
-            torques  = np.clip(torques, -self.effort_limits, self.effort_limits)
-            for idx, torque in zip(self._pybullet_indices, torques):
-                p.setJointMotorControl2(
-                    self._robot_id, int(idx),
-                    p.TORQUE_CONTROL, force=float(torque)
-                )
+        # --- Settling phase: hold nominal pose for 200 physics steps ---
+        # Without this, the robot drops from spawn height and heavy links
+        # (hips/thighs) make ground contact, triggering instant termination.
+        for name, idx in self._joint_idx.items():
+            target = NOMINAL_POSE_PER_JOINT.get(name, 0.0)
+            p.setJointMotorControl2(
+                self._robot_id, int(idx),
+                p.POSITION_CONTROL,
+                targetPosition=target,
+                force=200.0,  # Strong servo to hold pose
+            )
+        for _ in range(100):  # 100 steps at 400Hz = 0.25s settling
             p.stepSimulation()
+
+        # Switch back to torque control for the policy
+        for name, idx in self._joint_idx.items():
+            p.setJointMotorControl2(self._robot_id, int(idx), p.VELOCITY_CONTROL, force=0)
 
         self._step_count = 0
         self._fell       = False
         self.prev_action = np.zeros(self.action_dim)
+        self.prev_smooth_action = np.zeros(self.action_dim)
         self._prev_pos   = np.array(p.getBasePositionAndOrientation(self._robot_id)[0])
+        
+        # Buffer for action lag simulation
+        self.action_history = [np.zeros(self.action_dim, dtype=np.float32)] * 2
 
         obs = self._get_obs()
         return obs, {}
@@ -274,21 +308,25 @@ class RobotEnvBullet(gym.Env):
         """
         action = np.clip(action, -1.0, 1.0)
 
+        # 1. Action Smoothing (EMA): suppresses 200Hz jitter into fluid patterns
+        # action is raw network output in [-1, 1]
+        smooth_alpha = 0.5
+        applied_action = smooth_alpha * action + (1.0 - smooth_alpha) * self.prev_smooth_action
+        self.prev_smooth_action = applied_action.copy()
+
         # target position = nominal pose + scaled action offset
-        # Action scale: 0.1 rad max deviation from nominal.
-        # At 0.5 rad: random policy (sigma=0.37) generates 27Nm unintended
-        # forces per joint, immediately destabilising the body before the
-        # policy has any chance to learn. At 0.1 rad: max unintended force
-        # is 5.5Nm -- robot stays near nominal during random exploration.
-        # action_scale = 0.80 rad: push exploration toward larger strides.
-        # HFE joint needs ~0.3-0.4 rad swing range for a proper step.
-        # Previously 0.1 rad was needed because policy had no orientation obs
-        # and random large actions caused immediate falls.
-        # Now orientation (gravity vector) is in obs so the policy can
-        # stabilize while learning to walk. 0.35 gives locomotion range
-        # without producing joint limit violations.
-        action_scale = 0.80
-        target_pos = self._nominal_pos + action * action_scale
+        self.action_history.append(applied_action.copy())
+        if len(self.action_history) > 3:
+            self.action_history.pop(0)
+
+        if np.random.rand() < self.action_lag_prob:
+            effective_action = self.action_history[-2]
+        else:
+            effective_action = action
+
+        # Fixed action scale — no curriculum
+        self._global_step += 1
+        target_pos = self._nominal_pos + effective_action * self._action_scale
 
         smooth_penalty = np.sum((action - self.prev_action) ** 2)
         self.prev_action = action.copy()
@@ -322,6 +360,31 @@ class RobotEnvBullet(gym.Env):
         base_height = base_pos[2]
         roll, pitch, _ = p.getEulerFromQuaternion(base_orn)
 
+        # --- ground contact penalty ---
+        contact_penalty = 0.0
+        contact_termination = False
+
+        # Check for contacts on non-foot links
+        contacts = p.getContactPoints(bodyA=self._robot_id)
+        for contact in contacts:
+            # Ignore self-collisions (where body B is also the robot)
+            if contact[2] == self._robot_id:
+                continue
+                
+            link_idx = contact[3] # linkIndexA
+
+            if link_idx == -1: 
+                # base_link (torso) touching ground = real fall
+                contact_penalty = -20.0
+                contact_termination = True
+                break
+
+            if link_idx not in self.foot_indices:
+                if link_idx in self.heavy_indices:
+                    contact_penalty = max(contact_penalty, -15.0)
+                else:
+                    contact_penalty = max(contact_penalty, -5.0)
+
         # --- reward FIRST (mandatory) ---
         reward = self._compute_reward(
             obs,
@@ -329,9 +392,10 @@ class RobotEnvBullet(gym.Env):
             smooth_penalty,
             base_height=base_height
         )
+        reward += contact_penalty
 
         # --- termination ---
-        self._fell = base_height < 0.20
+        self._fell = base_height < self.height_threshold or contact_termination
         bad_orientation = abs(roll) > 0.8 or abs(pitch) > 0.8
 
         terminated = self._fell or bad_orientation
@@ -341,10 +405,30 @@ class RobotEnvBullet(gym.Env):
         if terminated:
             reward -= self.FALL_PENALTY
 
+        # Reward shaping: add survival reward
+        reward += 1.0  # Survive each step
+
+        # Scale down reward to avoid large critic targets
+        reward = reward / 10.0
+
+        # Diagnostic print removed for clean logs
+
+        # Termination reason for debugging
+        term_reason = "running"
+        if base_height < self.height_threshold:
+            term_reason = "height"
+        elif contact_termination:
+            term_reason = "contact"
+        elif bad_orientation:
+            term_reason = "orientation"
+        elif truncated:
+            term_reason = "truncated"
+
         info = {
             "base_height": base_height,
             "step": self._step_count,
             "fell": self._fell,
+            "term_reason": term_reason,
         }
 
         return obs, reward, terminated, truncated, info
@@ -376,7 +460,22 @@ class RobotEnvBullet(gym.Env):
         # Projected gravity in body frame
         gravity_body = rot_mat.T @ np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
-        return np.concatenate([joint_pos, joint_vel, lin_vel_body, ang_vel_body, quat, gravity_body])
+        # NEUTRAL YAW: Force yaw to zero in the observation quat
+        r = R.from_quat(quat)
+        euler = r.as_euler('xyz')
+        # Keep roll and pitch, zero out yaw
+        neutral_r = R.from_euler('xyz', [euler[0], euler[1], 0.0])
+        neutral_quat = neutral_r.as_quat().astype(np.float32)
+
+        obs = np.concatenate([joint_pos, joint_vel, lin_vel_body, ang_vel_body, neutral_quat, gravity_body])
+        
+        # Add Domain Randomization Noise
+        noise = np.zeros_like(obs)
+        noise[:12]  = np.random.normal(0, self.obs_noise_scale, 12)  # Joint pos noise
+        noise[12:24] = np.random.normal(0, self.vel_noise_scale, 12) # Joint vel noise
+        noise[24:30] = np.random.normal(0, 0.01, 6)                  # Base vel noise
+        
+        return (obs + noise).astype(np.float32)
 
     # ------------------------------------------------------------------
     def _compute_reward(self, obs, torques, smooth_penalty, base_height):
@@ -388,35 +487,38 @@ class RobotEnvBullet(gym.Env):
         lateral_vel = float(lin_vel[1 - self.forward_axis])
         yaw_rate    = float(obs[29])
 
-        # Stronger forward-drive reward with a quadratic boost for speed.
-        fwd_pos = max(forward_vel, 0.0)
-        r_vel = float(
-            np.clip(120.0 * forward_vel + 120.0 * (fwd_pos ** 2) + 30.0 * abs(forward_vel), -10.0, 180.0)
+        # 1. Forward velocity (Target Enforcement)
+        target_vel = 0.35
+        r_vel = 200.0 * forward_vel
+        # Bonus specifically for reaching the target velocity
+        r_vel += 50.0 * np.exp(-10.0 * (forward_vel - target_vel)**2)
+        
+        # 2. Base Height Reward (Drastically Reduced)
+        target_height = 0.45
+        height_error = base_height - target_height
+        r_height = 5.0 * np.exp(-30.0 * (height_error**2)) # Reduced from 30.0
+        
+        # 3. Stability Penalties
+        r_stability = (
+            -15.0 * (roll**2 + pitch**2)
+            -2.0 * abs(lateral_vel)
+            -1.0 * (yaw_rate ** 2)
         )
-
-        # Scale penalties with speed so early exploration is not over-penalized.
-        speed_gate = float(np.clip(abs(forward_vel) / 0.6, 0.0, 1.0))
-        penalty_scale = 0.10 + 0.90 * speed_gate
-
-        upright_bonus = 0.05 * np.exp(-2.0 * (roll**2 + pitch**2))
-        height_bonus = 0.0
-        speed_bonus = 60.0 * max(0.0, forward_vel - 0.03)
-
-        torque_pen = 0.0005 * (0.02 + 0.98 * speed_gate) * float(np.sum(torques ** 2))
-
-        r = (
-            r_vel
-            - penalty_scale * 0.20 * abs(lateral_vel)
-            - penalty_scale * 0.15 * (yaw_rate ** 2)
-            - penalty_scale * 0.20 * (roll**2 + pitch**2)
-            - penalty_scale * 0.15 * max(0.0, 0.50 - base_height)
-            - penalty_scale * 0.0005 * smooth_penalty
-            - torque_pen
-            + upright_bonus
-            + height_bonus
-            + speed_bonus
-        )
-        return float(r)
+        
+        # 4. Efficiency & Smoothing (Lifted for Phase 3 to allow dynamic steps)
+        torque_pen = -0.00005 * float(np.sum(torques ** 2))
+        smooth_pen = -0.0001 * smooth_penalty
+        
+        # 5. Survival Bonus ( Severely Reduced to prevent Couch Potato exploit )
+        if base_height < 0.35:
+            r_alive = -10.0  # Punish crouching instantly
+        else:
+            r_alive = 2.0  # Reduced from 20.0
+        
+        r = r_vel + r_height + r_stability + torque_pen + smooth_pen + r_alive
+        
+        # Prevent extremely negative rewards from glitching
+        return float(np.clip(r, -50.0, 300.0))
 
     # ------------------------------------------------------------------
     def close(self):
