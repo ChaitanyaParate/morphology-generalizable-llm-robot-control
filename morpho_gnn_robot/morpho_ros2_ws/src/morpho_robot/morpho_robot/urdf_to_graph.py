@@ -8,7 +8,7 @@ JOINT_TYPE_MAP = {k: i for i, k in enumerate(JOINT_TYPES)}
 CONTROLLABLE = {'revolute', 'continuous', 'prismatic'}
 STATIC_DIM = 11
 JOINT_RUNTIME = 2
-BODY_EXTRA = 13
+BODY_EXTRA = 15  # Includes 2 extra for command (vx, wy)
 RUNTIME_DIM = JOINT_RUNTIME + BODY_EXTRA
 NODE_DIM = STATIC_DIM + RUNTIME_DIM
 EDGE_DIM = 4
@@ -135,16 +135,18 @@ class URDFGraphBuilder:
         print(f'  Action dim       : {self.num_joints}  (one torque per controllable joint)')
         print(f'  Joint order      : {self.joint_names}')
 
-    def get_graph(self, joint_pos: Optional[np.ndarray]=None, joint_vel: Optional[np.ndarray]=None, body_quat: Optional[np.ndarray]=None, body_grav: Optional[np.ndarray]=None, body_lin_vel: Optional[np.ndarray]=None, body_ang_vel: Optional[np.ndarray]=None) -> Data:
+    def get_graph(self, joint_pos: Optional[np.ndarray]=None, joint_vel: Optional[np.ndarray]=None, body_quat: Optional[np.ndarray]=None, body_grav: Optional[np.ndarray]=None, body_lin_vel: Optional[np.ndarray]=None, body_ang_vel: Optional[np.ndarray]=None, command: Optional[np.ndarray]=None) -> Data:
         pos = joint_pos if joint_pos is not None else np.zeros(self.num_joints)
         vel = joint_vel if joint_vel is not None else np.zeros(self.num_joints)
         quat = body_quat if body_quat is not None else np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         grav = body_grav if body_grav is not None else np.array([0.0, 0.0, -1.0], dtype=np.float32)
         lin_vel = body_lin_vel if body_lin_vel is not None else np.zeros(3, dtype=np.float32)
         ang_vel = body_ang_vel if body_ang_vel is not None else np.zeros(3, dtype=np.float32)
+        cmd = command if command is not None else np.zeros(2, dtype=np.float32)
         joint_runtime = np.zeros((self.num_joints, RUNTIME_DIM), dtype=np.float32)
         joint_runtime[:, 0] = pos
         joint_runtime[:, 1] = vel
+        joint_runtime[:, 15:17] = cmd  # Broadcast command to all joints
         runtime_joints = torch.tensor(joint_runtime, dtype=torch.float)
         if self.add_body_node:
             body_runtime = np.zeros((1, RUNTIME_DIM), dtype=np.float32)
@@ -152,6 +154,7 @@ class URDFGraphBuilder:
             body_runtime[0, 6:9] = grav
             body_runtime[0, 9:12] = lin_vel
             body_runtime[0, 12:15] = ang_vel
+            body_runtime[0, 15:17] = cmd
             runtime = torch.cat([torch.tensor(body_runtime, dtype=torch.float), runtime_joints], dim=0)
         else:
             runtime = runtime_joints

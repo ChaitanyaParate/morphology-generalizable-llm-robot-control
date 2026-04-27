@@ -102,7 +102,8 @@ try:
         body_ang_vel = obs_n[num_joints * 2 + 3:num_joints * 2 + 6]
         body_quat = obs[num_joints * 2 + 6:num_joints * 2 + 10].astype(np.float32)
         body_grav = obs[num_joints * 2 + 10:num_joints * 2 + 13].astype(np.float32)
-        pyg_data = graph_builder.get_graph(joint_pos, joint_vel, body_quat=body_quat, body_grav=body_grav, body_lin_vel=body_lin_vel, body_ang_vel=body_ang_vel).to(device)
+        cmd = np.array([0.7, 0.0], dtype=np.float32)
+        pyg_data = graph_builder.get_graph(joint_pos, joint_vel, body_quat=body_quat, body_grav=body_grav, body_lin_vel=body_lin_vel, body_ang_vel=body_ang_vel, command=cmd).to(device)
         with torch.no_grad():
             h, batch = model._encode(pyg_data)
             joint_h = model._joint_embeddings(h, pyg_data)

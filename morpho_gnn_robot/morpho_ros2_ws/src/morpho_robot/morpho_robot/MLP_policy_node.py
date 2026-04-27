@@ -16,13 +16,17 @@ except ImportError as exc:
     print('        cd into the directory containing urdf_to_graph.py first.')
     raise SystemExit(1)
 NOMINAL_POSE_PER_JOINT = {'LF_HAA': 0.0, 'LF_HFE': 0.6, 'LF_KFE': -1.2, 'RF_HAA': 0.0, 'RF_HFE': 0.6, 'RF_KFE': -1.2, 'LH_HAA': 0.0, 'LH_HFE': -0.6, 'LH_KFE': 1.2, 'RH_HAA': 0.0, 'RH_HFE': -0.6, 'RH_KFE': 1.2}
-POSITION_SCALE = 0.5
+POSITION_SCALE = 0.6   # training scale — full stride for HFE/KFE joints
+HAA_SCALE = 0.15       # hip abductor joints only: tightly clamped to prevent roll-over in Gazebo
 JOINT_COMMAND_FMT = '/model/robot/joint/{}/cmd_pos'
 HIDDEN_DIM = 256
+# obs = [joint_pos(12) + joint_vel(12) + lin_vel(3) + ang_vel(3) + quat(4) + gravity(3) + cmd(2)] = 39
+OBS_DIM = 39
+# norm stats only cover first 37 dims (everything except the 2 command dims)
 OBS_NORM_DIM = 37
-ACTION_SMOOTH_ALPHA = 0.85
-MAX_CMD_STEP = 0.2
-STARTUP_HOLD_TICKS = 400
+ACTION_SMOOTH_ALPHA = 0.7
+MAX_CMD_STEP = 10.0
+STARTUP_HOLD_TICKS = 600  # 3 s at 200 Hz — let robot fully settle before policy takes over
 
 def _layer_init(layer, std=0.01, bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -98,11 +102,13 @@ class MLPPolicyNode(Node):
         self._joint_ready = False
         self._odom_ready = False
         self._cmd_initialized = False
+        self._current_skill = 'stand'
+        self.create_subscription(String, '/active_skill', self._cb_skill, 10)
         from rclpy.qos import qos_profile_sensor_data
         self.create_subscription(JointState, '/joint_states', self._cb_joint_states, qos_profile_sensor_data)
         self.create_subscription(Odometry, '/odom', self._cb_odom, qos_profile_sensor_data)
         self._vision_sub = self.create_subscription(String, '/scene_detections', self._cb_vision, rclpy.qos.qos_profile_sensor_data)
-        self._steer_bias = 0.05
+        self._steer_bias = 0.0
         self._joint_pubs = {jname: self.create_publisher(Float64, JOINT_COMMAND_FMT.format(jname), 10) for jname in self.builder.joint_names}
         self.create_timer(1.0 / 200, self._control_cb)
         self.get_logger().info(f"Ready. Publishing {self.builder.num_joints} joint commands to '{JOINT_COMMAND_FMT}' at 200 Hz.")
@@ -153,7 +159,7 @@ class MLPPolicyNode(Node):
     def _load_checkpoint(self, path: str) -> MLPActorCritic:
         self.get_logger().info(f'Loading checkpoint: {path}')
         raw = torch.load(path, map_location=self.device, weights_only=False)
-        model = MLPActorCritic(obs_dim=37, action_dim=self.builder.action_dim, hidden_dim=HIDDEN_DIM).to(self.device)
+        model = MLPActorCritic(obs_dim=OBS_DIM, action_dim=self.builder.action_dim, hidden_dim=HIDDEN_DIM).to(self.device)
         if isinstance(raw, dict):
             if 'agent' in raw:
                 state = raw['agent']
@@ -180,11 +186,12 @@ class MLPPolicyNode(Node):
         return model
 
     def _normalize_policy_obs(self, obs: np.ndarray) -> np.ndarray:
-        norm_dim = self._obs_norm_mean.shape[0]
+        # Normalize first OBS_NORM_DIM dims; leave command dims unnormalized
+        norm_dim = min(self._obs_norm_mean.shape[0], OBS_NORM_DIM)
         head = obs[:norm_dim]
         tail = obs[norm_dim:]
-        denom = np.sqrt(self._obs_norm_var) + 1e-08
-        head_n = np.clip((head - self._obs_norm_mean) / denom, -10.0, 10.0)
+        denom = np.sqrt(self._obs_norm_var[:norm_dim]) + 1e-08
+        head_n = np.clip((head - self._obs_norm_mean[:norm_dim]) / denom, -10.0, 10.0)
         return np.concatenate([head_n, tail], axis=0).astype(np.float32)
 
     def _cb_joint_states(self, msg: JointState):
@@ -236,6 +243,9 @@ class MLPPolicyNode(Node):
         except Exception as e:
             self.get_logger().error(f'Vision parse error: {e}')
 
+    def _cb_skill(self, msg: String):
+        self._current_skill = msg.data.lower().strip()
+
     def _control_cb(self):
         try:
             self._do_control()
@@ -274,8 +284,10 @@ class MLPPolicyNode(Node):
                 self._joint_pubs[jname].publish(msg)
             return
         rot_mat = self._get_rotation_matrix(base_quat)
-        base_lin_vel = rot_mat.T @ base_lin_vel
-        base_ang_vel = rot_mat.T @ base_ang_vel
+        if not self._odom_in_base_frame:
+            base_lin_vel = rot_mat.T @ base_lin_vel
+            base_ang_vel = rot_mat.T @ base_ang_vel
+        
         gravity_body = rot_mat.T @ np.array([0.0, 0.0, -1.0], dtype=np.float32)
         gravity_body[1] -= 0.04
         gravity_body = gravity_body / np.linalg.norm(gravity_body)
@@ -299,14 +311,28 @@ class MLPPolicyNode(Node):
             roll_est = gravity_body[1]
             left_avg = np.mean(np.abs(self._prev_action[:6]))
             right_avg = np.mean(np.abs(self._prev_action[6:12]))
-            self.get_logger().info(f'Telemetery | P/R: {pitch_est:.2f}/{roll_est:.2f} | L/R-Act: {left_avg:.3f}/{right_avg:.3f} | Steer: {self._steer_bias:.2f} | QuatRaw: [{base_quat[0]:.2f},{base_quat[1]:.2f},{base_quat[2]:.2f},{base_quat[3]:.2f}]')
+            self.get_logger().info(f'🤖 LLM COMMAND: >>> {self._current_skill.upper()} <<<')
+            self.get_logger().info(f'Telemetry | P/R: {pitch_est:.2f}/{roll_est:.2f} | L/R-Act: {left_avg:.3f}/{right_avg:.3f} | Steer: {self._steer_bias:.2f}')
             self._last_telemetry_time = now
         from scipy.spatial.transform import Rotation as R
         r = R.from_quat(base_quat)
         euler = r.as_euler('xyz')
         neutral_r = R.from_euler('xyz', [euler[0], euler[1], 0.0])
         neutral_quat = neutral_r.as_quat().astype(np.float32)
-        obs = np.concatenate([pos, vel, base_lin_vel, base_ang_vel, neutral_quat, gravity_body]).astype(np.float32)
+        
+        # Determine movement command based on LLM skill
+        vx, wy = 0.0, 0.0
+        if 'trot' in self._current_skill or 'walk' in self._current_skill:
+            vx, wy = 1.0, 0.0
+        elif 'turn_left' in self._current_skill:
+            vx, wy = 0.0, 1.0
+        elif 'turn_right' in self._current_skill:
+            vx, wy = 0.0, -1.0
+        elif 'stand' in self._current_skill:
+            vx, wy = 0.0, 0.0
+            
+        command = np.array([vx, wy], dtype=np.float32)
+        obs = np.concatenate([pos, vel, base_lin_vel, base_ang_vel, neutral_quat, gravity_body, command]).astype(np.float32)
         obs_n = self._normalize_policy_obs(obs)
         obs_t = torch.tensor(obs_n, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
@@ -327,8 +353,10 @@ class MLPPolicyNode(Node):
         right_scale = 1.0 - self._steer_bias
         for i, jname in enumerate(self.builder.joint_names):
             s = (left_scale if i < 6 else right_scale) * self._speed_multiplier
+            # HAA joints control lateral hip abduction; reduce their amplitude to prevent roll-over
+            joint_type_scale = HAA_SCALE if jname.endswith('_HAA') else 1.0
             trim = CALIBRATION_OFFSETS.get(jname, 0.0)
-            target = NOMINAL_POSE_PER_JOINT.get(jname, 0.0) + float(action_np[i] * POSITION_SCALE * s * ramp_factor) + trim
+            target = NOMINAL_POSE_PER_JOINT.get(jname, 0.0) + float(action_np[i] * POSITION_SCALE * s * joint_type_scale * ramp_factor) + trim
             target = float(np.clip(target, self._joint_lower[i], self._joint_upper[i]))
             delta = target - float(self._prev_cmd_pos[i])
             delta = float(np.clip(delta, -MAX_CMD_STEP, MAX_CMD_STEP))

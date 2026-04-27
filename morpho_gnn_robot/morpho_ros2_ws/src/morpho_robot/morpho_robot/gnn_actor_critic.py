@@ -6,14 +6,14 @@ from torch_geometric.nn import GATv2Conv, global_mean_pool
 from torch_geometric.data import Data, Batch
 from urdf_to_graph import NUM_NODE_ROLES
 
-def _layer_init(layer: nn.Linear, std: float=0.01, bias_const: float=0.0):
+def _layer_init(layer: nn.Linear, std: float=1.0, bias_const: float=0.0):
     nn.init.orthogonal_(layer.weight, std)
     nn.init.constant_(layer.bias, bias_const)
     return layer
 
 class SlimHeteroGNNActorCritic(nn.Module):
 
-    def __init__(self, node_dim: int=26, edge_dim: int=4, hidden_dim: int=48, num_joints: int=12, num_roles: int=NUM_NODE_ROLES):
+    def __init__(self, node_dim: int=28, edge_dim: int=4, hidden_dim: int=48, num_joints: int=12, num_roles: int=NUM_NODE_ROLES):
         super().__init__()
         self.num_joints = num_joints
         self.hidden_dim = hidden_dim
@@ -24,9 +24,9 @@ class SlimHeteroGNNActorCritic(nn.Module):
         self.norm1 = nn.LayerNorm(mid_dim)
         self.conv2 = GATv2Conv(in_channels=mid_dim, out_channels=hidden_dim, heads=1, edge_dim=edge_dim, concat=False, dropout=0.0)
         self.norm2 = nn.LayerNorm(hidden_dim)
-        self.actor_head = nn.Sequential(_layer_init(nn.Linear(hidden_dim, 32)), nn.Tanh(), _layer_init(nn.Linear(32, 1), std=0.01))
-        self.log_std = nn.Parameter(torch.full((num_joints,), -0.7))
-        self.critic_head = nn.Sequential(_layer_init(nn.Linear(hidden_dim, 32)), nn.Tanh(), _layer_init(nn.Linear(32, 1), std=1.0))
+        self.actor_head = nn.Sequential(_layer_init(nn.Linear(hidden_dim, 32), std=1.0), nn.Tanh(), _layer_init(nn.Linear(32, 1), std=0.01))
+        self.log_std = nn.Parameter(torch.full((num_joints,), -1.6))
+        self.critic_head = nn.Sequential(_layer_init(nn.Linear(hidden_dim, 32), std=1.0), nn.Tanh(), _layer_init(nn.Linear(32, 1), std=1.0))
 
     def _project(self, x: torch.Tensor, node_types: torch.Tensor) -> torch.Tensor:
         h = torch.empty(x.size(0), self.hidden_dim, device=x.device, dtype=x.dtype)
@@ -68,7 +68,7 @@ class SlimHeteroGNNActorCritic(nn.Module):
         mean = self.actor_head(joint_h)
         B = batch.max().item() + 1
         mean = mean.view(B, self.num_joints)
-        std = self.log_std.exp().clamp(min=0.12, max=0.6)
+        std = self.log_std.exp().clamp(min=0.05, max=0.3)
         std = std.unsqueeze(0).expand_as(mean)
         dist = Normal(mean, std)
         if action is None:
@@ -81,7 +81,7 @@ class SlimHeteroGNNActorCritic(nn.Module):
 GNNActorCritic = SlimHeteroGNNActorCritic
 HeteroGNNActorCritic = SlimHeteroGNNActorCritic
 if __name__ == '__main__':
-    NODE_DIM = 26
+    NODE_DIM = 28
     EDGE_DIM = 4
     N_JOINTS = 12
     N_NODES = 13

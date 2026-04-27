@@ -59,8 +59,13 @@ class SlimHeteroGNNActorCritic(nn.Module):
 
     def get_value(self, data: Data) -> torch.Tensor:
         h, batch = self._encode(data)
-        pooled = global_mean_pool(h, batch)
-        return self.critic_head(pooled)
+        # Use body node (index 0 per graph) for value — it has full proprioceptive context
+        ptr = getattr(data, 'ptr', None)
+        if ptr is None:
+            body_h = h[0:1]
+        else:
+            body_h = h[ptr[:-1]]  # first node of each graph in batch
+        return self.critic_head(body_h)
 
     def get_action_and_value(self, data: Data, action: torch.Tensor=None):
         h, batch = self._encode(data)
@@ -68,15 +73,20 @@ class SlimHeteroGNNActorCritic(nn.Module):
         mean = self.actor_head(joint_h)
         B = batch.max().item() + 1
         mean = mean.view(B, self.num_joints)
-        std = self.log_std.exp().clamp(min=0.05, max=0.3)
+        std = self.log_std.exp().clamp(min=0.05, max=0.6)
         std = std.unsqueeze(0).expand_as(mean)
         dist = Normal(mean, std)
         if action is None:
             action = dist.sample()
         log_prob = dist.log_prob(action).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
-        pooled = global_mean_pool(h, batch)
-        value = self.critic_head(pooled)
+        # Critic: use body node (index 0 per graph) for richer value estimate
+        ptr = getattr(data, 'ptr', None)
+        if ptr is None:
+            body_h = h[0:1]
+        else:
+            body_h = h[ptr[:-1]]
+        value = self.critic_head(body_h)
         return (action, log_prob, entropy, value)
 GNNActorCritic = SlimHeteroGNNActorCritic
 HeteroGNNActorCritic = SlimHeteroGNNActorCritic

@@ -125,14 +125,10 @@ class RobotEnvBullet(gym.Env):
         self._prev_pos = np.array(p.getBasePositionAndOrientation(self._robot_id)[0])
         self.action_history = [np.zeros(self.action_dim, dtype=np.float32)] * 2
         
-        # Sample command mode
-        mode = np.random.choice([0, 1, 2])
-        if mode == 0:  # Stand still
-            self.command = np.array([0.0, 0.0], dtype=np.float32)
-        elif mode == 1:  # Move forward
-            self.command = np.array([np.random.uniform(0.5, 1.0), 0.0], dtype=np.float32)
-        else:  # Rotate
-            self.command = np.array([0.0, np.random.choice([-1.0, 1.0]) * np.random.uniform(0.5, 1.0)], dtype=np.float32)
+        # Lock to forward-walk mode to break out of crouch local optimum
+        self.mode = 1
+        # Always command forward walking with randomized speed
+        self.command = np.array([np.random.uniform(0.5, 1.0), 0.0], dtype=np.float32)
             
         obs = self._get_obs()
         return (obs, {})
@@ -230,14 +226,19 @@ class RobotEnvBullet(gym.Env):
         
         cmd_vx, cmd_wy = self.command
         
-        r_alive = 1.0
+        r_alive = 0.1
         
         # Command tracking rewards
         lin_vel_error = (forward_vel - cmd_vx)**2
         ang_vel_error = (yaw_rate - cmd_wy)**2
         r_tracking_lin = np.exp(-2.0 * lin_vel_error)
         r_tracking_ang = np.exp(-2.0 * ang_vel_error)
-        r_vel = 1.5 * r_tracking_lin + 1.5 * r_tracking_ang
+        # Boosted linear weight (4.0 vs old 1.5) to break crouching local optimum
+        r_vel = 4.0 * r_tracking_lin + 1.5 * r_tracking_ang
+        
+        # Standing-still penalty: punish near-zero velocity when commanded to walk
+        if cmd_vx > 0.1 and abs(forward_vel) < 0.15:
+            r_vel -= 0.5
         
         if base_height < self.height_threshold:
             r_vel = 0.0

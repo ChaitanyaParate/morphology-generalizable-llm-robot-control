@@ -9,6 +9,9 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float64
+from geometry_msgs.msg import PoseStamped
+import math
+from torch_geometric.data import Batch
 try:
     from gnn_actor_critic import GNNActorCritic
     from urdf_to_graph import URDFGraphBuilder
@@ -16,15 +19,15 @@ except ImportError as e:
     print(f'[FATAL] Cannot import project modules: {e}')
     sys.exit(1)
 CONTROL_HZ = 200
-POSITION_SCALE = 0.8
+POSITION_SCALE = 0.6
 JOINT_COMMAND_FMT = '/model/robot/joint/{}/cmd_pos'
 HIDDEN_DIM = 48
 NOMINAL_POSE_PER_JOINT = {'LF_HAA': 0.0, 'LF_HFE': 0.6, 'LF_KFE': -1.2, 'RF_HAA': 0.0, 'RF_HFE': 0.6, 'RF_KFE': -1.2, 'LH_HAA': 0.0, 'LH_HFE': -0.6, 'LH_KFE': 1.2, 'RH_HAA': 0.0, 'RH_HFE': -0.6, 'RH_KFE': 1.2}
-ACTION_SMOOTH_ALPHA = 0.85
+ACTION_SMOOTH_ALPHA = 0.8
 MAX_CMD_STEP = 0.2
 STARTUP_HOLD_TICKS = 400
-YAW_KP = 0.15
-YAW_KD = 0.05
+YAW_KP = 0.0
+YAW_KD = 0.0
 LEFT_HAA_IDX = [0, 3]
 RIGHT_HAA_IDX = [6, 9]
 
@@ -57,6 +60,7 @@ class GNNPolicyNode(Node):
         self._world_ang_vel = np.zeros(3)
         self._prev_action = np.zeros(self.builder.action_dim, dtype=np.float32)
         self._prev_cmd_pos = np.array([NOMINAL_POSE_PER_JOINT.get(j, 0.0) for j in self.builder.joint_names], dtype=np.float32)
+        self._target_cmd = np.array([0.0, 0.0], dtype=np.float32)
         self._ticks = 0
         self._prev_yaw_rate = 0.0
         self._startup_hold_ticks = STARTUP_HOLD_TICKS
@@ -64,6 +68,7 @@ class GNNPolicyNode(Node):
         from rclpy.qos import qos_profile_sensor_data
         self.create_subscription(JointState, '/joint_states', self._cb_joint_states, qos_profile_sensor_data)
         self.create_subscription(Odometry, '/odom', self._cb_odom, qos_profile_sensor_data)
+        self.create_subscription(PoseStamped, '/goal_pose', self._cb_goal_pose, 10)
         self._joint_pubs = {jname: self.create_publisher(Float64, JOINT_COMMAND_FMT.format(jname), 10) for jname in self.builder.joint_names}
         self.create_timer(1.0 / CONTROL_HZ, self._control_cb)
         self.get_logger().info(f'Ready. Spinning {CONTROL_HZ} Hz control loop.')
@@ -107,6 +112,26 @@ class GNNPolicyNode(Node):
             self._world_ang_vel = np.array([msg.twist.twist.angular.x, msg.twist.twist.angular.y, msg.twist.twist.angular.z])
             self._raw_quat = np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w])
 
+    def _cb_goal_pose(self, msg: PoseStamped):
+        x = msg.pose.position.x
+        y = msg.pose.position.y
+        dist = math.hypot(x, y)
+        if dist < 0.1:
+            vx = 0.0
+            wy = 0.0
+        else:
+            vx = min(1.0, max(-0.5, x))
+            wy = min(1.0, max(-1.0, math.atan2(y, x)))
+        with self._lock:
+            self._target_cmd = np.array([vx, wy], dtype=np.float32)
+        
+        action_str = "standing still"
+        if vx > 0.1: action_str = "walking forward"
+        elif vx < -0.1: action_str = "walking backward"
+        elif abs(wy) > 0.1: action_str = "turning"
+        
+        self.get_logger().info(f'Received new command: [vx={vx:.2f}, wy={wy:.2f}] -> Robot should be {action_str}')
+
     def _control_cb(self):
         if not self._obs_ready:
             return
@@ -117,6 +142,7 @@ class GNNPolicyNode(Node):
             world_lin_vel = self._world_lin_vel.copy()
             world_ang_vel = self._world_ang_vel.copy()
             prev_cmd = self._prev_cmd_pos.copy()
+            target_cmd = self._target_cmd.copy()
         if self._startup_hold_ticks > 0:
             self._startup_hold_ticks -= 1
             for i, jname in enumerate(self.builder.joint_names):
@@ -141,9 +167,11 @@ class GNNPolicyNode(Node):
         n_v = norm_state[12:24]
         n_blv = norm_state[24:27]
         n_bav = norm_state[27:30]
-        graph = self.builder.get_graph(joint_pos=n_p, joint_vel=n_v, body_quat=bqv, body_grav=bgv, body_lin_vel=n_blv, body_ang_vel=n_bav).to(self.device)
+        graph = self.builder.get_graph(joint_pos=n_p, joint_vel=n_v, body_quat=bqv, body_grav=bgv, body_lin_vel=n_blv, body_ang_vel=n_bav, command=target_cmd)
+        batch = Batch.from_data_list([graph]).to(self.device)
         with torch.no_grad():
-            action, _, _, _ = self.model.get_action_and_value(graph)
+            joint_h = self.model._joint_embeddings(self.model._encode(batch)[0], batch)
+            action = self.model.actor_head(joint_h).view(1, self.model.num_joints)
         action_np = action.squeeze(0).cpu().numpy()
         action_np = np.clip(action_np, -1.0, 1.0)
         action_np = (1.0 - ACTION_SMOOTH_ALPHA) * self._prev_action + ACTION_SMOOTH_ALPHA * action_np

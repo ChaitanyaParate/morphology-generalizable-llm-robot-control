@@ -1,7 +1,6 @@
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-from mlp_actor_critic import MLPActorCritic
 from scipy.spatial.transform import Rotation as R
 try:
     import pybullet as p
@@ -23,20 +22,22 @@ class RobotEnvBullet(gym.Env):
     metadata = {'render_modes': ['human', 'direct']}
     FALL_PENALTY = 250.0
 
-    def __init__(self, urdf_path: str, max_episode_steps: int=1000, render_mode: str=None, forward_axis: int=0):
+    def __init__(self, urdf_path: str, max_episode_steps: int=1000, render_mode: str=None, forward_axis: int=0, height_threshold: float=0.25):
         super().__init__()
         self.urdf_path = urdf_path
         self.max_episode_steps = max_episode_steps
         self.render_mode = render_mode
         self.forward_axis = forward_axis
+        self.height_threshold = height_threshold
         self._parse_urdf()
         self.action_dim = len(self.joint_names)
-        self.obs_dim = self.action_dim * 2 + 13
+        self.obs_dim = self.action_dim * 2 + 15  # +2 for command (vx, wy)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.action_dim,), dtype=np.float32)
+        self.command = np.array([0.0, 0.0], dtype=np.float32)
         self.obs_noise_scale = 0.01
         self.vel_noise_scale = 0.02
-        self.action_lag_prob = 0.5
+        self.action_lag_prob = 0.0
         self.action_history = []
         if render_mode == 'human':
             self._physics_client = p.connect(p.GUI)
@@ -49,6 +50,8 @@ class RobotEnvBullet(gym.Env):
         self._step_count = 0
         self._fell = False
         self.prev_action = np.zeros(self.action_dim)
+        self.prev_smooth_action = np.zeros(self.action_dim)
+        self._action_scale = 0.6
 
     def _parse_urdf(self):
         import xml.etree.ElementTree as ET
@@ -69,9 +72,9 @@ class RobotEnvBullet(gym.Env):
     def _load_robot(self):
         if self._robot_id is not None:
             p.removeBody(self._robot_id)
-        start_pos = [0.0, 0.0, 0.65]
-        start_orient = p.getQuaternionFromEuler([0.0, 0.0, 0.0])
-        robot_id = p.loadURDF(self.urdf_path, start_pos, start_orient, useFixedBase=False, flags=p.URDF_USE_SELF_COLLISION)
+        start_pos = [0.0, 0.0, 0.5]
+        start_orient = p.getQuaternionFromEuler([np.random.uniform(-0.05, 0.05), np.random.uniform(-0.05, 0.05), 0.0])
+        robot_id = p.loadURDF(self.urdf_path, start_pos, start_orient, useFixedBase=False, flags=0)
         self._robot_id = robot_id
         num_joints = p.getNumJoints(robot_id)
         self._joint_idx: dict = {}
@@ -81,9 +84,9 @@ class RobotEnvBullet(gym.Env):
             info = p.getJointInfo(robot_id, i)
             name = info[1].decode('utf-8')
             link_name = info[12].decode('utf-8')
-            if '_FOOT' in link_name:
+            if any((x in link_name.upper() for x in ['FOOT', 'ADAPTER', 'SHANK'])):
                 self.foot_indices.append(i)
-            elif 'HIP' in link_name or 'THIGH' in link_name:
+            elif 'HIP' in link_name.upper() or 'THIGH' in link_name.upper():
                 self.heavy_indices.append(i)
             if name in self.joint_names:
                 self._joint_idx[name] = i
@@ -108,34 +111,41 @@ class RobotEnvBullet(gym.Env):
         plane_id = p.loadURDF('plane.urdf')
         p.changeDynamics(plane_id, -1, lateralFriction=PLANE_LATERAL_FRICTION, spinningFriction=PLANE_SPINNING_FRICTION, rollingFriction=PLANE_ROLLING_FRICTION)
         self._load_robot()
-        for _ in range(240):
-            states = p.getJointStates(self._robot_id, self._pybullet_indices.tolist())
-            curr_pos = np.array([s[0] for s in states])
-            curr_vel = np.array([s[1] for s in states])
-            torques = KP * (self._nominal_pos - curr_pos) - KD * curr_vel
-            torques = np.clip(torques, -self.effort_limits, self.effort_limits)
-            for idx, torque in zip(self._pybullet_indices, torques):
-                p.setJointMotorControl2(self._robot_id, int(idx), p.TORQUE_CONTROL, force=float(torque))
+        for name, idx in self._joint_idx.items():
+            target = NOMINAL_POSE_PER_JOINT.get(name, 0.0)
+            p.setJointMotorControl2(self._robot_id, int(idx), p.POSITION_CONTROL, targetPosition=target, force=200.0)
+        for _ in range(100):
             p.stepSimulation()
+        for name, idx in self._joint_idx.items():
+            p.setJointMotorControl2(self._robot_id, int(idx), p.VELOCITY_CONTROL, force=0)
         self._step_count = 0
         self._fell = False
         self.prev_action = np.zeros(self.action_dim)
+        self.prev_smooth_action = np.zeros(self.action_dim)
         self._prev_pos = np.array(p.getBasePositionAndOrientation(self._robot_id)[0])
         self.action_history = [np.zeros(self.action_dim, dtype=np.float32)] * 2
+
+        # Lock to forward-walk mode to break out of crouch local optimum
+        self.mode = 1
+        # Always command forward walking with randomized speed
+        self.command = np.array([np.random.uniform(0.5, 1.0), 0.0], dtype=np.float32)
+
         obs = self._get_obs()
         return (obs, {})
 
     def step(self, action: np.ndarray):
         action = np.clip(action, -1.0, 1.0)
-        self.action_history.append(action.copy())
+        smooth_alpha = 0.8
+        applied_action = smooth_alpha * action + (1.0 - smooth_alpha) * self.prev_smooth_action
+        self.prev_smooth_action = applied_action.copy()
+        self.action_history.append(applied_action.copy())
         if len(self.action_history) > 3:
             self.action_history.pop(0)
         if np.random.rand() < self.action_lag_prob:
             effective_action = self.action_history[-2]
         else:
             effective_action = action
-        action_scale = 0.8
-        target_pos = self._nominal_pos + effective_action * action_scale
+        target_pos = self._nominal_pos + effective_action * self._action_scale
         smooth_penalty = np.sum((action - self.prev_action) ** 2)
         self.prev_action = action.copy()
         states = p.getJointStates(self._robot_id, self._pybullet_indices.tolist())
@@ -153,29 +163,31 @@ class RobotEnvBullet(gym.Env):
         contact_termination = False
         contacts = p.getContactPoints(bodyA=self._robot_id)
         for contact in contacts:
+            if contact[2] == self._robot_id:
+                continue
             link_idx = contact[3]
-            if link_idx == -1:
-                contact_penalty = -20.0
+            if link_idx not in self.foot_indices:
+                contact_penalty = -0.5
                 contact_termination = True
                 break
-            if link_idx not in self.foot_indices:
-                contact_penalty = -5.0
-                if link_idx in self.heavy_indices:
-                    contact_penalty = -20.0
-                    contact_termination = True
-                    break
         base_pos, base_orn = p.getBasePositionAndOrientation(self._robot_id)
         base_height = base_pos[2]
         roll, pitch, _ = p.getEulerFromQuaternion(base_orn)
-        reward = self._compute_reward(obs, torques, smooth_penalty, base_height=base_height)
-        reward += contact_penalty
-        self._fell = base_height < 0.2 or contact_termination
+        reward = self._compute_reward(obs, torques, smooth_penalty, base_height=base_height, contact_penalty=contact_penalty)
+        self._fell = base_height < self.height_threshold
         bad_orientation = abs(roll) > 0.8 or abs(pitch) > 0.8
-        terminated = self._fell or bad_orientation
+        terminated = self._fell or bad_orientation or contact_termination
         truncated = self._step_count >= self.max_episode_steps
-        if terminated:
-            reward -= self.FALL_PENALTY
-        info = {'base_height': base_height, 'step': self._step_count, 'fell': self._fell}
+        term_reason = 'running'
+        if base_height < self.height_threshold:
+            term_reason = 'height'
+        elif contact_termination:
+            term_reason = 'contact'
+        elif bad_orientation:
+            term_reason = 'orientation'
+        elif truncated:
+            term_reason = 'truncated'
+        info = {'base_height': base_height, 'step': self._step_count, 'fell': self._fell, 'term_reason': term_reason}
         return (obs, reward, terminated, truncated, info)
 
     def _get_obs(self) -> np.ndarray:
@@ -195,7 +207,7 @@ class RobotEnvBullet(gym.Env):
         euler = r.as_euler('xyz')
         neutral_r = R.from_euler('xyz', [euler[0], euler[1], 0.0])
         neutral_quat = neutral_r.as_quat().astype(np.float32)
-        obs = np.concatenate([joint_pos, joint_vel, lin_vel_body, ang_vel_body, neutral_quat, gravity_body])
+        obs = np.concatenate([joint_pos, joint_vel, lin_vel_body, ang_vel_body, neutral_quat, gravity_body, self.command])
         noise = np.zeros_like(obs)
         n_j = self.action_dim
         noise[:n_j] = np.random.normal(0, self.obs_noise_scale, n_j)
@@ -203,23 +215,38 @@ class RobotEnvBullet(gym.Env):
         noise[n_j * 2:n_j * 2 + 6] = np.random.normal(0, 0.01, 6)
         return (obs + noise).astype(np.float32)
 
-    def _compute_reward(self, obs, torques, smooth_penalty, base_height):
+    def _compute_reward(self, obs, torques, smooth_penalty, base_height, contact_penalty=0.0):
         lin_vel = obs[24:27]
         base_pos, base_orn = p.getBasePositionAndOrientation(self._robot_id)
         roll, pitch, _ = p.getEulerFromQuaternion(base_orn)
         forward_vel = float(lin_vel[self.forward_axis])
         lateral_vel = float(lin_vel[1 - self.forward_axis])
         yaw_rate = float(obs[29])
-        r_vel = 300.0 * forward_vel
-        target_height = 0.45
-        height_error = base_height - target_height
-        r_height = 10.0 * np.exp(-20.0 * height_error ** 2)
-        r_stability = -2.0 * (roll ** 2 + pitch ** 2) - 2.0 * abs(lateral_vel) - 1.0 * yaw_rate ** 2
-        torque_pen = -0.0005 * float(np.sum(torques ** 2))
-        smooth_pen = -0.001 * smooth_penalty
-        r_moving = -15.0 if abs(forward_vel) < 0.05 else 0.0
-        r = r_vel + r_height + r_stability + torque_pen + smooth_pen + r_moving
-        return float(np.clip(r, -50.0, 300.0))
+
+        cmd_vx, cmd_wy = self.command
+
+        r_alive = 0.1
+
+        # Command tracking rewards (matches Training_Location GNN env)
+        lin_vel_error = (forward_vel - cmd_vx) ** 2
+        ang_vel_error = (yaw_rate - cmd_wy) ** 2
+        r_tracking_lin = np.exp(-2.0 * lin_vel_error)
+        r_tracking_ang = np.exp(-2.0 * ang_vel_error)
+        # Boosted linear weight (4.0 vs old 1.5) to break crouching local optimum
+        r_vel = 4.0 * r_tracking_lin + 1.5 * r_tracking_ang
+
+        # Standing-still penalty: punish near-zero velocity when commanded to walk
+        if cmd_vx > 0.1 and abs(forward_vel) < 0.15:
+            r_vel -= 0.5
+
+        if base_height < self.height_threshold:
+            r_vel = 0.0
+            r_alive = -self.FALL_PENALTY
+
+        r_stability = -1.0 * (roll ** 2 + pitch ** 2) - 0.5 * abs(lateral_vel)
+        torque_pen = -5e-06 * float(np.sum(torques ** 2))
+        r = r_alive + r_vel + r_stability + torque_pen + contact_penalty
+        return float(np.clip(r, -5.0, 5.0))
 
     def close(self):
         if p.isConnected(self._physics_client):

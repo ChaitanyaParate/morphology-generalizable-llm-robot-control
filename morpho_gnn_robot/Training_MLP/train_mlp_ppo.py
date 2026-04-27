@@ -35,7 +35,7 @@ class RunningNorm:
 
 @dataclass
 class Config:
-    urdf_path: str = '/mnt/newvolume/Programming/Python/Deep_Learning/Relational_Bias_for_Morphological_Generalization/morpho_gnn_robot/morpho_ros2_ws/src/morpho_robot/urdf/anymal.urdf'
+    urdf_path: str = 'auto'
     max_episode_steps: int = 1000
     seed: int = 0
     total_timesteps: int = 12000000
@@ -88,6 +88,20 @@ def parse_args() -> Config:
                 setattr(cfg, f_name, v)
     if not cfg.run_name:
         cfg.run_name = f'mlp_ppo_seed{cfg.seed}_{int(time.time())}'
+    if cfg.urdf_path == 'auto':
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        # Priority: local stripped URDF -> kaggle working dir -> ros2 ws
+        for candidate in [
+            os.path.join(base_dir, 'anymal_stripped.urdf'),
+            os.path.join(base_dir, 'anymal.urdf'),
+            '/kaggle/working/anymal.urdf',
+            os.path.join(base_dir, '..', 'morpho_ros2_ws', 'src', 'morpho_robot', 'urdf', 'anymal.urdf'),
+        ]:
+            if os.path.exists(candidate):
+                cfg.urdf_path = os.path.abspath(candidate)
+                break
+        else:
+            raise FileNotFoundError('Could not find anymal.urdf. Pass --urdf-path explicitly.')
     return cfg
 
 class RolloutBuffer:
@@ -194,9 +208,13 @@ def train(cfg: Config):
     global_step = start_global_step
     episode_lengths: List[int] = []
     episode_forward_vels: List[float] = []
+    episode_cmd_lin_errors: List[float] = []
+    episode_cmd_ang_errors: List[float] = []
     ep_reward = 0.0
     ep_length = 0
     ep_forward_vel_sum = 0.0
+    ep_cmd_lin_error_sum = 0.0
+    ep_cmd_ang_error_sum = 0.0
     start_time = time.time()
     target_timesteps = cfg.total_timesteps
     while global_step < target_timesteps:
@@ -217,14 +235,20 @@ def train(cfg: Config):
             done = terminated or truncated
             ep_reward += reward
             ep_forward_vel_sum += float(obs[24 + env.forward_axis])
+            ep_cmd_lin_error_sum += abs(float(obs[24 + env.forward_axis]) - float(obs[37]))
+            ep_cmd_ang_error_sum += abs(float(obs[29]) - float(obs[38]))
             buffer.store(obs_t, action, logprob, reward, float(done), value)
             if done:
                 episode_rewards.append(ep_reward)
                 episode_lengths.append(ep_length)
                 episode_forward_vels.append(ep_forward_vel_sum / max(ep_length, 1))
+                episode_cmd_lin_errors.append(ep_cmd_lin_error_sum / max(ep_length, 1))
+                episode_cmd_ang_errors.append(ep_cmd_ang_error_sum / max(ep_length, 1))
                 ep_reward = 0.0
                 ep_length = 0
                 ep_forward_vel_sum = 0.0
+                ep_cmd_lin_error_sum = 0.0
+                ep_cmd_ang_error_sum = 0.0
                 obs, _ = env.reset()
         with torch.no_grad():
             next_obs_in = _policy_obs(obs, obs_norm, obs_norm_dim)
@@ -286,14 +310,18 @@ def train(cfg: Config):
             mean_ep_rew = np.mean(episode_rewards[-20:])
             mean_ep_len = np.mean(episode_lengths[-20:])
             mean_ep_fwd = np.mean(episode_forward_vels[-20:])
+            mean_ep_lin_err = np.mean(episode_cmd_lin_errors[-20:])
+            mean_ep_ang_err = np.mean(episode_cmd_ang_errors[-20:])
         else:
             mean_ep_rew = 0.0
             mean_ep_len = 0.0
             mean_ep_fwd = 0.0
-        print(f'step={global_step:>8d} | ep_rew={mean_ep_rew:>8.2f} | ep_len={mean_ep_len:>6.0f} | ep_fwd={mean_ep_fwd:>6.3f} | pg={np.mean(pg_losses):>7.4f} | vf={np.mean(vf_losses):>7.4f} | ent={np.mean(ent_losses):>6.4f} | clip={np.mean(clip_fracs):.3f} | kl={np.mean(approx_kls):.5f} | ev={explained_var:>6.3f} | lr_m={optimizer.param_groups[0]['lr']:.2e} | lr_a={optimizer.param_groups[1]['lr']:.2e} | lr_c={optimizer.param_groups[2]['lr']:.2e} | sps={sps}')
+            mean_ep_lin_err = 0.0
+            mean_ep_ang_err = 0.0
+        print(f'step={global_step:>8d} | ep_rew={mean_ep_rew:>8.2f} | ep_len={mean_ep_len:>6.0f} | cmd_lin_err={mean_ep_lin_err:>6.3f} | cmd_ang_err={mean_ep_ang_err:>6.3f} | pg={np.mean(pg_losses):>7.4f} | vf={np.mean(vf_losses):>7.4f} | ent={np.mean(ent_losses):>6.4f} | clip={np.mean(clip_fracs):.3f} | kl={np.mean(approx_kls):.5f} | ev={explained_var:>6.3f} | lr_m={optimizer.param_groups[0]["lr"]:.2e} | sps={sps}')
         if cfg.track:
             import wandb
-            wandb.log({'charts/ep_reward_mean': mean_ep_rew, 'charts/ep_length_mean': mean_ep_len, 'charts/ep_forward_vel_mean': mean_ep_fwd, 'losses/policy_loss': np.mean(pg_losses), 'losses/value_loss': np.mean(vf_losses), 'losses/entropy': np.mean(ent_losses), 'charts/clip_frac': np.mean(clip_fracs), 'losses/approx_kl': np.mean(approx_kls), 'losses/explained_variance': explained_var, 'charts/sps': sps, 'charts/learning_rate_mlp': optimizer.param_groups[0]['lr'], 'charts/learning_rate_actor': optimizer.param_groups[1]['lr'], 'charts/learning_rate_critic': optimizer.param_groups[2]['lr']}, step=global_step)
+            wandb.log({'charts/ep_reward_mean': mean_ep_rew, 'charts/ep_length_mean': mean_ep_len, 'charts/ep_cmd_lin_error_mean': mean_ep_lin_err, 'charts/ep_cmd_ang_error_mean': mean_ep_ang_err, 'losses/policy_loss': np.mean(pg_losses), 'losses/value_loss': np.mean(vf_losses), 'losses/entropy': np.mean(ent_losses), 'charts/clip_frac': np.mean(clip_fracs), 'losses/approx_kl': np.mean(approx_kls), 'losses/explained_variance': explained_var, 'charts/sps': sps, 'charts/learning_rate_mlp': optimizer.param_groups[0]['lr']}, step=global_step)
         if global_step % cfg.save_every < cfg.num_steps:
             ckpt_path = os.path.join(cfg.checkpoint_dir, f'mlp_ppo_{global_step}.pt')
             torch.save({'global_step': global_step, 'agent': agent.state_dict(), 'optimizer': optimizer.state_dict(), 'episode_rewards': episode_rewards, 'obs_norm_mean': obs_norm.mean, 'obs_norm_var': obs_norm.var, 'obs_norm_count': obs_norm.count}, ckpt_path)
